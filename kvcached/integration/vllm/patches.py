@@ -1227,6 +1227,9 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
         def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
             if enable_kvcached():
+                from kvcached.dp_namespace import bind_data_parallel_namespace
+
+                bind_data_parallel_namespace(vllm_config.parallel_config)
                 # OffloadingConnector allocates cross-layer KV tensors outside
                 # kvcached's VMM path (issue #267). Reject before any startup.
                 kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
@@ -1292,6 +1295,16 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                     )
                 os.environ["KVCACHED_PP_SIZE"] = str(pp_size)
 
+                device_kwargs = {}
+                if (
+                    int(getattr(parallel_config, "data_parallel_size", 1)) > 1
+                    and int(parallel_config.tensor_parallel_size) == 1
+                    and pp_size == 1
+                ):
+                    device_kwargs["device"] = (
+                        f"cuda:{parallel_config.data_parallel_rank_local}"
+                    )
+
                 # Keep TP ranks local to each PP stage. A negative PP rank
                 # marks coordinator operations that must reach every stage.
                 init_kvcached(
@@ -1300,6 +1313,7 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                     pp_rank=-1 if pp_size > 1 else 0,
                     is_worker=False,
                     async_sched=_should_enable_async_sched(vllm_config),
+                    **device_kwargs,
                 )
             result = original_init(self, vllm_config, *args, **kwargs)
             if enable_kvcached():
@@ -2176,6 +2190,9 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 logger.warning("Failed to initialize kvcached, disabling: %s", e)
 
         def _init_kvcached(self) -> None:
+            from kvcached.dp_namespace import bind_data_parallel_namespace
+
+            bind_data_parallel_namespace(self.vllm_config.parallel_config)
             # Get TP rank/size: these are always available at model runner init time.
             try:
                 from vllm.distributed.parallel_state import (

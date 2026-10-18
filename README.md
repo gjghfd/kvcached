@@ -20,6 +20,13 @@
 
 <h2 align="center">Make GPU Sharing Flexible and Easy </h2>
 
+> **Research on the fork's `main`:** Development uses `git@github.com:gjghfd/kvcached.git`;
+> `origin` points to this fork and `upstream` retains `ovg-project/kvcached`.
+> Cross-model attention-DP / KV-headroom research is maintained entirely in
+> [experiments/dp_opt/README.md](experiments/dp_opt/README.md), including its
+> `docs/` designs/protocols and `reports/` settings/results. That directory is
+> the single source of truth; Aegaeon remains a separate baseline reference.
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ads.jpg" alt="Make GPU Sharing Flexible and Easy" width="500" />
 </p>

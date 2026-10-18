@@ -1,0 +1,447 @@
+{
+  "schema_version": 3,
+  "status": "graph_motivation_verified_eager_controls_complete_cross_model_b_c_planned",
+  "document_owner": "kvcached:main",
+  "path_base": "ParaCloud_workspace_root_for_implementation_report_and_evidence_fields",
+  "summary": "kvcached/experiments/dp_opt/reports/motivation-summary.md",
+  "protocol": "kvcached/experiments/dp_opt/docs/motivation-protocol.md",
+  "branch": "main",
+  "repository": "git@github.com:gjghfd/kvcached.git",
+  "base_commit": "04ccd1da0653d251622122d0695d72bb288fb8ec",
+  "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+  "serving_backend": "native_vllm+kvcached",
+  "scope": {
+    "proves_cross_model_kv_capacity_reclamation": false,
+    "original_headroom_design_requires_shared_or_elastic_physical_kv_capacity": true,
+    "single_model_system_motivation_only": true
+  },
+  "parallel": {
+    "physical_gpus": 2,
+    "attention_tp": 1,
+    "pp": 1,
+    "dp": 2,
+    "ep": 2
+  },
+  "main_serving_baseline": "cuda_graph",
+  "main_runtime": {
+    "enforce_eager": false,
+    "cudagraph_mode": "FULL_DECODE_ONLY",
+    "compilation_mode": 0,
+    "capture_sizes": [
+      1,
+      8,
+      16,
+      32,
+      64,
+      128,
+      256
+    ],
+    "moe_backend": "triton",
+    "attention_backend": "FLASH_ATTN_FA2",
+    "all2all_backend": "allgather_reducescatter",
+    "enable_dbo": false,
+    "enable_eplb": false,
+    "async_scheduling": false,
+    "enable_prefix_caching": false,
+    "sleep": false,
+    "cpu_kv_offload": false,
+    "max_model_len": 4096,
+    "max_num_seqs": 256,
+    "max_num_batched_tokens": 4096,
+    "kv_cache_bytes_per_rank": 47244640256,
+    "performance_hot_path_file_io": false
+  },
+  "main_workload": {
+    "services": 1,
+    "requests_in_declared_order": [
+      128,
+      256,
+      32
+    ],
+    "input_tokens": 1024,
+    "output_tokens": 512,
+    "layouts": [
+      "B/2:B/2",
+      "B:0",
+      "0:B"
+    ],
+    "paired_repeats": 3,
+    "primary_trials_per_case": 12,
+    "trim_steps_each_end": 32,
+    "minimum_stable_steps": 128,
+    "seed": 42,
+    "temperature": 0,
+    "ignore_eos": true,
+    "route_header": "X-data-parallel-rank",
+    "endpoint": "/v1/completions",
+    "target_decode_throughput_loss": 0.3,
+    "requires_both_orientation_lower_95_loss_bounds": true
+  },
+  "graph_main": {
+    "status": "completed_raw_verified_target_achieved_with_graph_padding",
+    "job": "229748",
+    "dependency_afterany": "229747",
+    "started_at": "2026-10-18T20:34:13+08:00",
+    "node": "d1n41a14g01",
+    "ended_at": "2026-10-18T20:53:23+08:00",
+    "state": "COMPLETED/0:0",
+    "regression_tests_passed": 236,
+    "execution": "FULL_DECODE_ONLY_compile_mode_0",
+    "requests": [
+      128,
+      256,
+      32
+    ],
+    "input_tokens": 1024,
+    "output_tokens": 512,
+    "repeats": 3,
+    "mechanism": "max_rank_padding_not_pure_unpadded_attention",
+    "batch128_decode_loss": [
+      0.323650794527403,
+      0.32207878068252505
+    ],
+    "batch128_loss95_lower_bounds": [
+      0.3178362406771813,
+      0.307060241087018
+    ],
+    "batch256_decode_loss": [
+      0.3852112131097941,
+      0.3835432666976926
+    ],
+    "batch256_loss95_lower_bounds": [
+      0.3815731892442999,
+      0.3790050100413377
+    ],
+    "batch32_decode_loss": [
+      0.28400270299664077,
+      0.2955844675987168
+    ],
+    "batch32_target_confirmed": false,
+    "target_confirmed": true,
+    "raw_verified_trials": 36,
+    "raw_verified_requests": 4992,
+    "raw_verified_output_tokens": 2555904,
+    "peak_kv_utilization": 0.8713253653826947,
+    "stable_waiting_or_preemption": false,
+    "report": "kvcached/experiments/dp_opt/reports/graph-results.md",
+    "evidence": "evidence/kvcached-graph-229748/"
+  },
+  "historical_eager_runtime": {
+    "enforce_eager": true,
+    "moe_backend": "triton",
+    "all2all_backend": "allgather_reducescatter",
+    "enable_dbo": false,
+    "async_scheduling": false,
+    "enable_prefix_caching": false,
+    "max_model_len": 4096,
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 512,
+    "performance_hot_path_file_io": false
+  },
+  "historical_eager_workload": {
+    "requests_per_model": 16,
+    "input_tokens": 128,
+    "output_tokens": 256,
+    "temperature": 0,
+    "ignore_eos": true,
+    "kv_cache_bytes_per_service_rank": 2147483648,
+    "paired_repeats_minimum": 3,
+    "discard_stable_steps_each_end": 32,
+    "minimum_measured_stable_steps": 128,
+    "route_header": "X-data-parallel-rank",
+    "endpoint": "/v1/completions",
+    "stream_token_ids": true,
+    "fail_on_preemption_or_waiting_in_window": true
+  },
+  "experiment_a": {
+    "status": "completed_verified",
+    "implementation": "kvcached/experiments/dp_opt/motivation.py",
+    "submitted_job": "226683",
+    "submitted_at": "2026-10-17T20:26:23+08:00",
+    "completed_at": "2026-10-17T21:21:57+08:00",
+    "node": "d1n41a18g02",
+    "gpu": "NVIDIA A800-SXM4-80GB",
+    "evidence": "evidence/kvcached-motivation-226683/",
+    "services": 1,
+    "layouts": [
+      [
+        8,
+        8
+      ],
+      [
+        10,
+        6
+      ],
+      [
+        12,
+        4
+      ],
+      [
+        14,
+        2
+      ],
+      [
+        16,
+        0
+      ]
+    ],
+    "swap_hot_rank": true,
+    "paired_repeats": 3,
+    "balanced_control_at_each_repeat_start_and_end": true,
+    "shuffle_unbalanced_layouts": true,
+    "shuffle_seed": 42,
+    "measured_trials": 30,
+    "primary_timing": "scheduler_verified_stable_rank_host_execute_cadence",
+    "cuda_event_step_timing": false
+  },
+  "length_followup": {
+    "status": "completed_verified_phase_isolation_unresolved",
+    "submitted_job": "227012",
+    "submitted_at": "2026-10-17T22:46:10+08:00",
+    "last_checked_at": "2026-10-18T15:39:44+08:00",
+    "started_at": "2026-10-18T00:11:28+08:00",
+    "completed_at": "2026-10-18T01:07:25+08:00",
+    "node": "d1n41a28g03",
+    "gpu": "NVIDIA A800-SXM4-80GB",
+    "slurm_state": "COMPLETED",
+    "exit_code": "0:0",
+    "main_requests": 576,
+    "main_output_tokens": 442368,
+    "regression_tests_passed": 225,
+    "implementation": "kvcached/experiments/dp_opt/motivation-lengths.sbatch",
+    "services": 1,
+    "same_allocation_and_gpu_pair_for_all_lengths": true,
+    "lengths_input_output": [
+      [
+        128,
+        256
+      ],
+      [
+        128,
+        1024
+      ],
+      [
+        8192,
+        1024
+      ]
+    ],
+    "layouts": [
+      [
+        8,
+        8
+      ],
+      [
+        16,
+        0
+      ],
+      [
+        0,
+        16
+      ]
+    ],
+    "paired_repeats": 3,
+    "balanced_controls_at_repeat_start_and_end": true,
+    "primary_trials_per_length": 12,
+    "max_model_len": 10240,
+    "kv_cache_bytes_per_rank": 25769803776,
+    "phase_diagnostic_trials_per_length": 3,
+    "phase_sampling_stride": 32,
+    "phase_ranges": [
+      "attention",
+      "attention_core",
+      "moe",
+      "dispatch",
+      "combine",
+      "worker_execute"
+    ],
+    "nested_phase_ranges_must_not_be_summed_twice": true,
+    "diagnostics_excluded_from_primary_results": true,
+    "half_attention_share_requires_linear_batch_scaling_and_skewed_time_denominator": true,
+    "phase_isolation_valid": false,
+    "phase_sample_host_overhead_pct_range": [
+      9.5,
+      19.2
+    ],
+    "long_case_extreme_decode_loss_pct": [
+      3.4216,
+      3.4404
+    ],
+    "long_case_extreme_burst_loss_pct": [
+      13.4764,
+      13.5984
+    ],
+    "long_case_ttft_s_balanced_and_extremes": [
+      4.94,
+      9.6259,
+      9.7583
+    ],
+    "evidence": "evidence/kvcached-lengths-227012/",
+    "report": "kvcached/experiments/dp_opt/reports/length-results.md"
+  },
+  "batch_followup": {
+    "status": "resume_completed_target_not_achieved",
+    "submitted_job": "229639",
+    "submitted_at": "2026-10-18T18:59:46+08:00",
+    "started_at": "2026-10-18T19:00:12+08:00",
+    "node": "d1n41a22g03",
+    "failed_at": "2026-10-18T19:30:56+08:00",
+    "completed_screening_cases": 7,
+    "maximum_screened_decode_loss": 0.08348422629960395,
+    "resume_job": "229747",
+    "resume_started_at": "2026-10-18T19:53:16+08:00",
+    "resume_node": "d1n41a15g01",
+    "resume_ended_at": "2026-10-18T20:33:43+08:00",
+    "resume_state": "COMPLETED/0:0",
+    "confirmation_decode_loss_batch256": [
+      0.08161259204471494,
+      0.06002268988407866
+    ],
+    "confirmation_decode_loss_batch128_ctx2048": [
+      0.05138142400609914,
+      0.026057804490343672
+    ],
+    "target_confirmed": false,
+    "resume_regression_tests_passed": 236,
+    "resume_screens_selection_only_fresh_confirmations": true,
+    "primary_target_decode_throughput_loss": 0.3,
+    "requires_two_orientation_lower_95_loss_bounds": true,
+    "screening_repeats": 1,
+    "confirmation_repeats": 3,
+    "screening_cases": 10,
+    "confirmed_candidates": 2,
+    "batch_sizes_at_1024_input_512_output": [
+      16,
+      32,
+      64,
+      128,
+      256
+    ],
+    "kv_batch_context_pairs": [
+      [
+        8,
+        32768
+      ],
+      [
+        16,
+        16384
+      ],
+      [
+        32,
+        8192
+      ],
+      [
+        64,
+        4096
+      ],
+      [
+        128,
+        2048
+      ]
+    ],
+    "kv_cache_bytes_per_rank": 47244640256,
+    "max_model_len": 33792,
+    "max_num_seqs": 256,
+    "max_num_batched_tokens": 4096,
+    "regression_tests_passed": 232,
+    "evidence": "evidence/kvcached-batch-20261018/"
+  },
+  "experiment_b": {
+    "status": "planned_not_executed",
+    "services": 2,
+    "layouts": [
+      {
+        "name": "balanced",
+        "a": [
+          8,
+          8
+        ],
+        "b": [
+          8,
+          8
+        ]
+      },
+      {
+        "name": "co_directional_12",
+        "a": [
+          12,
+          4
+        ],
+        "b": [
+          12,
+          4
+        ]
+      },
+      {
+        "name": "opposite_12",
+        "a": [
+          12,
+          4
+        ],
+        "b": [
+          4,
+          12
+        ]
+      },
+      {
+        "name": "co_directional_16",
+        "a": [
+          16,
+          0
+        ],
+        "b": [
+          16,
+          0
+        ]
+      },
+      {
+        "name": "opposite_16",
+        "a": [
+          16,
+          0
+        ],
+        "b": [
+          0,
+          16
+        ]
+      }
+    ],
+    "swap_hot_rank": true,
+    "cross_tenant_batching": false,
+    "shared_physical_kv_pool": false
+  },
+  "experiment_c": {
+    "status": "planned_not_executed",
+    "services": 1,
+    "short_requests": 8,
+    "longer_requests": 8,
+    "short_input_tokens": 128,
+    "longer_input_tokens": 512,
+    "output_tokens": 256,
+    "kv_cache_bytes_per_service_rank": 2147483648,
+    "layouts": [
+      {
+        "name": "length_segregated",
+        "rank0": {
+          "short": 8,
+          "longer": 0
+        },
+        "rank1": {
+          "short": 0,
+          "longer": 8
+        }
+      },
+      {
+        "name": "length_mixed",
+        "rank0": {
+          "short": 4,
+          "longer": 4
+        },
+        "rank1": {
+          "short": 4,
+          "longer": 4
+        }
+      }
+    ],
+    "swap_hot_rank": true
+  }
+}
