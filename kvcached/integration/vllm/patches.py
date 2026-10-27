@@ -1319,6 +1319,10 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             if enable_kvcached():
                 self._kvcached_install_ordered_unmap()
                 self._kvcached_start_limit_watch()
+                if os.environ.get("DP_OPT_LIVE_PLACEMENT") == "1":
+                    from live_scheduler import bind_engine
+
+                    bind_engine(self)
             return result
 
         patch_logger = self.logger

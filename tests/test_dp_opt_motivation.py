@@ -285,6 +285,27 @@ def test_graph_padding_must_match_the_registered_batch(motivation):
         motivation.stable_window(traces, [8, 8], expected_cudagraph_mode="FULL")
 
 
+def test_graph_capture_rounding_is_declared_and_verified(motivation):
+    traces = [trace(rank, count) for rank, count in enumerate((10, 6))]
+    for item in traces:
+        for event in item["events"]:
+            event["batch"]["cudagraph_mode"] = "FULL"
+            event["batch"]["padded_tokens"] = 16
+    window = motivation.stable_window(traces, [10, 6], expected_cudagraph_mode="FULL",
+                                      capture_sizes=[1, 8, 16])
+    assert window["ranks"]["0"]["padded_tokens"] == [16]
+    assert window["ranks"]["1"]["unpadded_tokens"] == [6]
+    with pytest.raises(RuntimeError, match="declared max-rank padding"):
+        motivation.stable_window(traces, [10, 6], expected_cudagraph_mode="FULL",
+                                  capture_sizes=[1, 8, 10, 16])
+
+
+@pytest.mark.parametrize("sizes", ([8, 1, 16], [1, 8, 8], [0, 8], []))
+def test_invalid_graph_capture_sizes_are_rejected(motivation, sizes):
+    with pytest.raises(ValueError, match="strictly increasing"):
+        motivation.graph_padding([10, 6], sizes)
+
+
 def test_summary_writes_csv_and_valid_svg(motivation, tmp_path):
     import xml.etree.ElementTree as element_tree
 

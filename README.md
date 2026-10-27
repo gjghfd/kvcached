@@ -26,6 +26,8 @@
 > [experiments/dp_opt/README.md](experiments/dp_opt/README.md), including its
 > `docs/` designs/protocols and `reports/` settings/results. That directory is
 > the single source of truth; Aegaeon remains a separate baseline reference.
+> Start with the [research summary](experiments/dp_opt/reports/research-summary.md)
+> for the current admission/return ILP, consolidated results and remaining limits.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ads.jpg" alt="Make GPU Sharing Flexible and Easy" width="500" />

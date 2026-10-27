@@ -127,8 +127,10 @@ Eager 与 graph 使用不同节点、maxlen，不把绝对 cadence 差当作成�
 吞吐损失，说明 placement 不能只追求 KV 容量均衡。还需建模每个模型内部的 DP 最大 batch、
 capture 档位/padding 和真实上下文；只让跨模型整卡总请求数相等，不保证各模型内部均衡。
 
-后续需测 graph 的中间不均衡度曲线及低扰动 kernel profile，再验证双模型同时驻留时的
-load/KV tradeoff、admission/SLO 和 placement 收益。**这些收益尚未实测。**
+Graph 中间曲线的 sparse 30 trial 已由 230346 完成，初始单一仿射关系不通过残差标准；
+231467 已同 allocation 完成 sparse/dense；两种配置的单一仿射拟合均不通过预声明残差标准，
+详见 `curve-results.md`。后续需验证双模型
+同时驻留时的 load/KV tradeoff、admission/SLO 和 placement 收益。**这些收益尚未实测。**
 
 ## 9. 证据与复现入口
 

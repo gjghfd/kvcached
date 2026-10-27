@@ -17,14 +17,16 @@ export ENABLE_KVCACHED=true KVCACHED_AUTOPATCH=1
 export KVCACHED_MIN_RESERVED_PAGES=0 KVCACHED_MAX_RESERVED_PAGES=0
 export KVCACHED_PAGE_PREALLOC_ENABLED=false
 mode="${DP_OPT_BENCHMARK_MODE:-combined}"
-max_model_len="${DP_OPT_MAX_MODEL_LEN:-4096}"
-kv_cache_bytes="${DP_OPT_KV_CACHE_BYTES:-2147483648}"
+max_model_len="${DP_OPT_MAX_MODEL_LEN:-32768}"
+kv_cache_bytes="${DP_OPT_KV_CACHE_BYTES:-4294967296}"
 max_num_seqs="${DP_OPT_MAX_NUM_SEQS:-32}"
 max_num_batched_tokens="${DP_OPT_MAX_BATCHED_TOKENS:-512}"
 execution_mode="${DP_OPT_EXECUTION_MODE:-eager}"
 execution_args=(--enforce-eager)
 if [[ "$execution_mode" == graph ]]; then
-    execution_args=(-cc '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,8,16,32,64,128,256]}')
+    capture_sizes="${DP_OPT_CAPTURE_SIZES:-1,8,16,32,64,128,256}"
+    [[ "$capture_sizes" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo 'Invalid capture sizes' >&2; exit 1; }
+    execution_args=(-cc "{\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[$capture_sizes]}")
 elif [[ "$execution_mode" != eager ]]; then
     printf 'Unknown execution mode: %s\n' "$execution_mode" >&2
     exit 1
@@ -36,12 +38,15 @@ if [[ "$mode" == motivation ]]; then
     worker_class=motivation_worker.MotivationWorker
     export VLLM_SERVER_DEV_MODE=1
 fi
-evidence="$deploy/state/dual-qwen-$SLURM_JOB_ID"
+run_label="${DP_OPT_RUN_LABEL:-}"
+[[ "$run_label" =~ ^[a-zA-Z0-9_-]*$ ]] || { echo 'Invalid run label' >&2; exit 1; }
+job_tag="$SLURM_JOB_ID${run_label:+-$run_label}"
+evidence="$deploy/state/dual-qwen-$job_tag"
 mkdir -p "$evidence" "$deploy/logs"
 export DP_OPT_EVIDENCE_ROOT="$evidence"
 ports="${DP_OPT_PORT_BASE:-$((20000 + (SLURM_JOB_ID % 1000) * 20))}"
 temporary_root="$(mktemp -d "/tmp/kq-$SLURM_JOB_ID.XXXXXX")"
-endpoint="$deploy/state/endpoint-$SLURM_JOB_ID"
+endpoint="$deploy/state/endpoint-$job_tag"
 pids=()
 monitor_pid=''
 cleanup() {
@@ -68,6 +73,7 @@ trap 'exit 143' TERM
     scontrol show job "$SLURM_JOB_ID"
     nvidia-smi --query-gpu=index,uuid,name,memory.total --format=csv
     nvidia-smi topo -m
+    printf 'execution_mode=%s\ncapture_sizes=%s\nrun_label=%s\n' "$execution_mode" "${capture_sizes:-none}" "$run_label"
     git -C "$repo" rev-parse HEAD
     git -C "$repo" branch --show-current
     git -C "$repo" remote -v
@@ -113,13 +119,13 @@ for service_index in $(seq 1 "$service_count"); do
         "${execution_args[@]}" --max-model-len "$max_model_len" --max-num-seqs "$max_num_seqs" --max-num-batched-tokens "$max_num_batched_tokens" \
         --gpu-memory-utilization 0.43 --kv-cache-memory-bytes "$kv_cache_bytes" \
         --no-enable-prefix-caching --no-async-scheduling \
-        > "$deploy/logs/dual-qwen-$SLURM_JOB_ID-$service.log" 2>&1 &
+        > "$deploy/logs/dual-qwen-$job_tag-$service.log" 2>&1 &
     pid=$!
     pids+=("$pid")
     healthy=0
     for attempt in $(seq 1 180); do
         if ! kill -0 "$pid" 2>/dev/null; then
-            tail -100 "$deploy/logs/dual-qwen-$SLURM_JOB_ID-$service.log" >&2
+            tail -100 "$deploy/logs/dual-qwen-$job_tag-$service.log" >&2
             exit 1
         fi
         if curl --fail --silent --max-time 5 "http://127.0.0.1:$port/health" >/dev/null; then
@@ -132,7 +138,12 @@ for service_index in $(seq 1 "$service_count"); do
 done
 printf '%s %s %s\n' "$(hostname)" "$ports" "$((ports + 10))" > "$endpoint"
 if [[ "$mode" == motivation ]]; then
-    if [[ "${DP_OPT_GRAPH_SUITE:-0}" == 1 ]]; then
+    if [[ "${DP_OPT_GRAPH_CURVE:-0}" == 1 ]]; then
+        python "$repo/experiments/dp_opt/motivation.py" \
+            --url "http://127.0.0.1:$ports" --checkpoint "$checkpoint" --evidence-root "$evidence" \
+            --requests 128 --input-tokens 1024 --output-tokens 512 \
+            --case-name "graph-curve-$run_label" --expected-cudagraph-mode FULL --capture-sizes "$capture_sizes"
+    elif [[ "${DP_OPT_GRAPH_SUITE:-0}" == 1 ]]; then
         python "$repo/experiments/dp_opt/graph_sweep.py" \
             --url "http://127.0.0.1:$ports" --checkpoint "$checkpoint" --evidence-root "$evidence"
     elif [[ "${DP_OPT_BATCH_SUITE:-0}" == 1 ]]; then

@@ -180,6 +180,29 @@ def test_engine_core_records_tp_world_size_before_original_init(
     original_init.assert_called_once()
 
 
+@pytest.mark.parametrize("enabled,opt_in", ((False, "0"), (False, "1"), (True, "0"), (True, "1")))
+def test_live_placement_hook_is_opt_in_after_initialization(monkeypatch, vllm_modules, enabled, opt_in):
+    interfaces, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: enabled)
+    monkeypatch.setattr(interfaces, "init_kvcached", mock.Mock())
+    monkeypatch.setattr(patches, "_should_enable_async_sched", lambda config: False)
+    monkeypatch.setenv("DP_OPT_LIVE_PLACEMENT", opt_in)
+    order = []
+    module = types.ModuleType("live_scheduler")
+    module.bind_engine = lambda engine: order.append("bind")
+    monkeypatch.setitem(sys.modules, "live_scheduler", module)
+
+    class EngineCore:
+        def __init__(self, config):
+            order.append("init")
+
+    config = types.SimpleNamespace(parallel_config=types.SimpleNamespace(
+        tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1))
+    assert patches.EngineCorePatch().patch_engine_init(types.SimpleNamespace(EngineCore=EngineCore))
+    EngineCore(config)
+    assert order == (["init", "bind"] if enabled and opt_in == "1" else ["init"])
+
+
 def test_engine_core_propagates_kvcached_initialization_failure(
     monkeypatch, vllm_modules
 ):

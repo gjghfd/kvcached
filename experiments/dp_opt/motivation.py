@@ -112,7 +112,17 @@ def valid_decode(event, expected_ids):
                     for request in requests))
 
 
-def stable_window(traces, counts, trim=32, minimum=128, expected_cudagraph_mode="NONE"):
+def graph_padding(counts, capture_sizes=None):
+    maximum = max(counts)
+    if capture_sizes is None:
+        return maximum
+    if not capture_sizes or sorted(set(capture_sizes)) != list(capture_sizes) or min(capture_sizes) < 1:
+        raise ValueError("Capture sizes must be strictly increasing positive integers")
+    return next((size for size in capture_sizes if size >= maximum), None)
+
+
+def stable_window(traces, counts, trim=32, minimum=128, expected_cudagraph_mode="NONE",
+                  capture_sizes=None):
     request_ids = {}
     valid = {}
     for rank, trace in enumerate(traces):
@@ -154,7 +164,7 @@ def stable_window(traces, counts, trim=32, minimum=128, expected_cudagraph_mode=
                 batch["padded_tokens"] != expected_tokens for batch in batches):
             raise RuntimeError("Eager decode must not silently pad the batch")
         if expected_cudagraph_mode == "FULL" and any(
-                batch["padded_tokens"] != max(counts) for batch in batches):
+                batch["padded_tokens"] != graph_padding(counts, capture_sizes) for batch in batches):
             raise RuntimeError("Full-graph decode must match its declared max-rank padding")
         cadence[str(rank)] = {
             "steps": len(events), "dummy_steps": sum(event["kind"] == "dummy" for event in events),
@@ -184,7 +194,7 @@ def client_window(records, start, end):
 
 
 def run_trial(endpoint, prompt_set, trial, root, names, idle_memory, output_tokens,
-              case_name="", profile_phases=False, expected_cudagraph_mode="NONE"):
+              case_name="", profile_phases=False, expected_cudagraph_mode="NONE", capture_sizes=None):
     trial_id = trial["id"]
     before, metrics_before = wait_idle(endpoint, names, idle_memory)
     request_json(endpoint["url"], "/collective_rpc", {
@@ -235,7 +245,8 @@ def run_trial(endpoint, prompt_set, trial, root, names, idle_memory, output_toke
         "metrics_before": metrics_before, "metrics_after": metrics_after,
     })
     traces = [json.loads((root / "traces" / f"{trial_id}-dp{rank}.json").read_text()) for rank in (0, 1)]
-    window = stable_window(traces, trial["layout"], expected_cudagraph_mode=expected_cudagraph_mode)
+    window = stable_window(traces, trial["layout"], expected_cudagraph_mode=expected_cudagraph_mode,
+                           capture_sizes=capture_sizes)
     phase_profile = {}
     if profile_phases:
         for trace in traces:
@@ -419,11 +430,15 @@ def main():
     parser.add_argument("--screening", action="store_true")
     parser.add_argument("--skip-overhead-controls", action="store_true")
     parser.add_argument("--expected-cudagraph-mode", choices=("NONE", "FULL", "PIECEWISE"), default="NONE")
+    parser.add_argument("--capture-sizes", type=lambda value: [int(size) for size in value.split(",")])
     args = parser.parse_args()
     if args.repeats != (1 if args.screening else 3) or args.output_tokens < 256 or args.input_tokens < 1:
         parser.error("This fixture requires three repeats and at least 256 output tokens")
     try:
         balanced = list(layouts(args.requests)[0])
+        if args.capture_sizes is not None:
+            if args.expected_cudagraph_mode != "FULL" or graph_padding([args.requests, 0], args.capture_sizes) is None:
+                raise ValueError("Declared capture sizes must cover the full-graph extreme")
     except ValueError as error:
         parser.error(str(error))
     if args.case_name and not re.fullmatch(r"[a-zA-Z0-9_-]+", args.case_name):
@@ -503,6 +518,7 @@ def main():
                            "case_name": args.case_name, "capacity": capacity,
                            "extremes_only": args.extremes_only, "screening": args.screening,
                            "expected_cudagraph_mode": args.expected_cudagraph_mode,
+                           "capture_sizes": args.capture_sizes,
                            "overhead_controls": not args.skip_overhead_controls}, "trials": []}
     overhead_controls = []
     for repeat in range(0 if args.skip_overhead_controls else 3):
@@ -523,7 +539,8 @@ def main():
     try:
         for trial in plan:
             result = run_trial(endpoint, prompts, trial, root, names, idle_memory, args.output_tokens,
-                               args.case_name, expected_cudagraph_mode=args.expected_cudagraph_mode)
+                               args.case_name, expected_cudagraph_mode=args.expected_cudagraph_mode,
+                               capture_sizes=args.capture_sizes)
             report["trials"].append({key: value for key, value in result.items()
                                       if key not in ("requests", "samples")})
             save_json(root / "results.json", report)

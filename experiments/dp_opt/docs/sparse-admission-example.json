@@ -1,0 +1,13 @@
+{
+  "scope": "Synthetic request-private-memory admission example, not a Qwen migration measurement",
+  "counts": [[64, 63], [80, 48]],
+  "capacity_gib": [24, 24],
+  "initial_gib": [23.90625, 23.90625],
+  "new_gib": 0.1875,
+  "admission_cost_s": [0, 0],
+  "movable": [
+    {"id": "A1", "model": 0, "source": 1, "memory_gib": 0.09375, "move_cost_s": 0.01},
+    {"id": "B0", "model": 1, "source": 0, "memory_gib": 0.09375, "move_cost_s": 0.01},
+    {"id": "B1", "model": 1, "source": 1, "memory_gib": 0.09375, "move_cost_s": 0.01}
+  ]
+}

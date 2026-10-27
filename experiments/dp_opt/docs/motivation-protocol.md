@@ -58,7 +58,9 @@ Phase diagnostics 要独立于主性能 trial，并报告扰动；顺序 traced/
 两个独立 resident tenant 在同一对 GPU 上，各自DP2/EP2/TP1、独立benchmark进程。
 固定每模型请求数和长度，比较两模型都均衡、同向倾斜、反向倾斜，并交换 hot rank。
 原始矩阵保留16请求下12:4和16:0候选，执行前需结合主 graph batch 区间重新冻结配置，
-不能宣称这些旧候选已测；graph中间I曲线同样尚未执行。
+不能宣称这些旧候选已测。graph 中间 I 的 230346 sparse 部分完整验证后睡前取消，
+231467 在同 allocation 完成 sparse/dense（COMPLETED/0:0）；冻结配置见 `curve-protocol.md`，结果见
+`../reports/curve-results.md`。
 
 分别记录每模型及整卡负载、padded batch、真实KV与等待/抢占；先保持KV非瓶颈隔离compute，
 再在可证明的物理KV headroom压力下测 tradeoff。两卡跨模型总请求数相等不保证各模型内部均衡。
@@ -75,4 +77,5 @@ Phase diagnostics 要独立于主性能 trial，并报告扰动；顺序 traced/
 成本函数必须包含模型内部DP最大batch、capture档位、真实context、EP同步与rank-local KV。
 跨rank migration需要正确的request ownership commit、live页copy、源页释放和目标可复用容量验证；
 先跑 correctness/数据面，再比 KV-only、load-only、联合策略与强 greedy baseline 的 goodput/SLO。
-具体系统设计归 `placement-design.md`；本页不记录未测收益。
+具体系统设计归 `placement-design.md`；rank 枚举与跨模型 ILP 的公式/约束归
+`ilp-scheduler-design.md`。当前只完成 CPU 代数 reference，不记录未测迁移收益。

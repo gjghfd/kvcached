@@ -6,7 +6,8 @@
 已完成 motivation 的结论与有效性边界见 `../reports/motivation-summary.md`；eager 留作历史对照。
 设计协议见 `motivation-protocol.md`，状态见 `experiment-matrix.json`。
 下文按日期保留 early deployment/容量推导，不能将旧“当前”配置当作 graph 主配置。
-后续 request/KV ownership 迁移、双模型干扰和 placement 收益仍未实现/测量。
+request/KV ownership 迁移已有实验原型，GPU 验证待完成；双模型干扰和 placement
+收益仍未测量。实现/验证边界见 `live-placement.md` 和 `../reports/live-placement-status.md`。
 此文的 `evidence/` 路径相对于外层 ParaCloud 工作区，不属于 kvcached Git 仓库。
 
 ## 1. 原始研究问题
@@ -28,7 +29,9 @@ baseline见 `../reports/dual-qwen-results.md`。本页不复制性能表、作�
 
 两租户可复用同checkpoint，但请求/KV/SLO/EP组独立，不等于GPU权重去重或跨租户前缀共享。
 原生DP/EP部署正确性和KV按需增长/回收已验证；这不证明源rank释放的live请求物理页已被
-目标模型复用。跨rank request/KV ownership迁移、容量handoff、跨模型placement收益仍未实现/测量。
+目标模型复用。作业233056已验证小规模跨rank request/KV ownership迁移和ILP准入，
+但实际释放来自A自身的页，B迁移未释放源页；跨租户容量handoff和placement收益
+仍未测量。功能结果与限制见 `../reports/live-placement-status.md`。
 Aegaeon Simple模型切换baseline的机制与部署边界仅维护在该checkout的baseline文档。
 
 ## 3. Qwen 的容量模型
@@ -76,7 +79,7 @@ benchmark位于 `kvcached/experiments/dp_opt/`。编译作业225943完成并通�
 
 真实 Qwen 双服务 DPA=2/EP=2 小上下文正确性与并发基线已经由作业 `223641` 建立，下一步做 shared-pool/migration 原型。可以复用已安装 vLLM 的 Qwen kernel 与 parallel config；集群版本显式存在 `data_parallel_size`、`enable_expert_parallel` 和 `all2all_backend`。新硬件或 P=4/8 布局仍需各自真实验证，不能由这次两卡结果推断。
 
-2026-10-17 的候选后端调研：OSDI ’26 **Prism: Cost-Efficient Multi-LLM Serving via GPU Memory Ballooning** 及其开源balloon driver **kvcached** 支持多个活跃模型/live KV同卡驻留，并通过VMM把空闲物理页归还以供其他模型分配；空闲模型也可sleep/evict，因此不是所有模型永久驻留。它提供我们所需的弹性容量机制，但不等于已有Qwen attention-DP迁移实现。Prism本身已有headroom-aware模型placement，研究区别需落在固定EP专家布局下的跨租户attention/KV home调整及其compute代价。详细边界、源码行号和验证顺序在 `kvcached-prism-review.md`；本地 `kvcached/` 当前基线为 `04ccd1da0653d251622122d0695d72bb288fb8ec`，已在用户fork的`main`开发，已通过225965并发baseline；迁移实验仍未实现。
+2026-10-17 的候选后端调研：OSDI ’26 **Prism: Cost-Efficient Multi-LLM Serving via GPU Memory Ballooning** 及其开源balloon driver **kvcached** 支持多个活跃模型/live KV同卡驻留，并通过VMM把空闲物理页归还以供其他模型分配；空闲模型也可sleep/evict，因此不是所有模型永久驻留。它提供我们所需的弹性容量机制，但不等于已有Qwen attention-DP迁移实现。Prism本身已有headroom-aware模型placement，研究区别需落在固定EP专家布局下的跨租户attention/KV home调整及其compute代价。详细边界、源码行号和验证顺序在 `kvcached-prism-review.md`；本地 `kvcached/` 当前基线为 `04ccd1da0653d251622122d0695d72bb288fb8ec`，已在用户fork的`main`开发，已通过225965并发baseline；2026-10-19 迁移原型的新增实现和待验证状态见 `live-placement.md`。
 
 两模型 A/B 都跨同一组物理 GPU，分别持有自己的 DPA/EP 组和执行状态，同一 GPU 上的两个租户从同一个物理 KV 页池分配。两个独立 vLLM 进程的静态私有 KV cache 不是 shared pool；必须提供可跨租户回收、复用的 GPU 页分配层。
 
@@ -134,13 +137,16 @@ benchmark位于 `kvcached/experiments/dp_opt/`。编译作业225943完成并通�
 
 固定 GPU 数与策略后再比较 2/4/8-rank 扩展；不能仅用跨 GPU 型号的结果宣称调度扩展性。
 
-## 8. 最小调度器
+## 8. Rank 枚举 + 跨模型 ILP 调度器
+
+2026-10-19 的 sparse 专用算法、成本公式和跨模型取舍例子见
+[sparse-scheduler.md](sparse-scheduler.md)；后续固定默认 sparse，不再增加 capture 档位。
 
 候选 A 目标 rank g 的需要释放量：`deficit_g = max(0, current_or_predicted_A_KV + margin - free_KV_g)`。
 
-从 g 上其他模型的可迁移请求中选择集合 S 和合法目的 ranks，满足源端能释放至少 deficit、每个目的 rank 有空间容纳实际页加增长余量，且各模型 SLO/collective 约束仍可接受。
+对新 A 请求的每个合法 attention/KV-home rank g 分别求解 ILP。变量包含 A/B 两模型的现有请求最终位置及迁移顺序，不限于 g 上的 B 请求；允许先迁入、再迁出以解除目标端容量瓶颈。EP ranks 和专家分片固定，不通过停用空 attention rank 改变拓扑。
 
-第一版用 greedy：低迁移字节、足够释放空间、目的 rank 可行、B 有足够 slack。对多个候选 g 比较 `estimated_transfer_time + request_pause + attention/EP_penalty + SLO_penalty`，不要先预定一个人为偏好的 rank。
+目标最小化预测 horizon 内 A/B 总 decode 延迟与迁移/准入暂停代价，再选最优 g；greedy 仅保留为强基线。端点给出的 `T=T0*(1+alpha*I)` 暂定仿射 cadence 模型不通过 230346 的 sparse 中间曲线检验，不能强称线性。使用 capture-aware / 布局查表成本（ILP 仍是线性目标），并独立校准双模型共址系数；吞吐损失始终为 `1-1/R`，不等于 cadence excess。完整公式、页释放、复制峰值约束与最优性边界见 [ilp-scheduler-design.md](ilp-scheduler-design.md)，实测见 `../reports/curve-results.md`。
 
 腾出空间后限制 B 的新请求重新填入目标 rank，维持短期 reservation；不能让独立均衡器立刻把 B 迁回。设置 cooldown 和最大迁移次数，并记录反向迁移与请求 starvation。
 

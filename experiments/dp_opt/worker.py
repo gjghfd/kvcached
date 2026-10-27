@@ -53,6 +53,7 @@ class VerificationWorker(Worker):
             "kv_runtime": runtime,
             "ipc_name": utils.DEFAULT_IPC_NAME,
             "initialized_ns": time.time_ns(),
+            "dp_pause_sync_interval": int(os.environ.get("DP_OPT_PAUSE_SYNC_INTERVAL", "32")),
         }
         path = Path(os.environ["DP_OPT_EVIDENCE_ROOT"]) / (
             f'worker-{record["service"]}-dp{record["dp_rank"]}.json'
@@ -60,3 +61,44 @@ class VerificationWorker(Worker):
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(record, indent=2) + "\n")
         temporary.replace(path)
+        self._benefit_capture_enabled = False
+        self._benefit_capture_counts = {}
+        if os.environ.get("DP_OPT_CAPTURE_EVIDENCE") == "1":
+            original = self.model_runner._determine_batch_execution_and_padding
+
+            def capture(*args, **kwargs):
+                result = original(*args, **kwargs)
+                if self._benefit_capture_enabled:
+                    mode, batch, ubatch, across_dp, stats = result
+                    key = (str(mode), int(batch.num_tokens), int(kwargs.get("num_tokens", 0)), bool(ubatch))
+                    self._benefit_capture_counts[key] = self._benefit_capture_counts.get(key, 0) + 1
+                return result
+
+            self.model_runner._determine_batch_execution_and_padding = capture
+
+    def placement_memory_snapshot(self, release_unused=False):
+        torch.cuda.synchronize(self.device)
+        if release_unused:
+            torch.cuda.empty_cache()
+        free, total = torch.cuda.mem_get_info(self.device)
+        return {"gpu_uuid": str(torch.cuda.get_device_properties(self.device).uuid),
+                "gpu_name": torch.cuda.get_device_name(self.device),
+                "free_mib": free / 1024**2, "total_mib": total / 1024**2,
+                "torch_allocated_mib": torch.cuda.memory_allocated(self.device) / 1024**2,
+                "torch_reserved_mib": torch.cuda.memory_reserved(self.device) / 1024**2,
+                "released_unused_allocator_cache": release_unused}
+
+    def benefit_capture(self, command):
+        if os.environ.get("DP_OPT_CAPTURE_EVIDENCE") != "1":
+            raise RuntimeError("Capture evidence was not enabled before worker initialization")
+        if command == "start":
+            self._benefit_capture_counts = {}
+            self._benefit_capture_enabled = True
+        elif command == "stop":
+            self._benefit_capture_enabled = False
+        else:
+            raise ValueError("Unknown capture evidence command")
+        return {"rank": self.parallel_config.data_parallel_rank,
+                "histogram": [{"mode": key[0], "padded_tokens": key[1], "unpadded_tokens": key[2],
+                               "ubatch": key[3], "steps": count}
+                              for key, count in sorted(self._benefit_capture_counts.items())]}

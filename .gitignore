@@ -189,3 +189,6 @@ tools/.addlicense.lock
 # macOS metadata files
 .DS_Store
 ._*
+
+experiments/dp_opt/.workaware-stage/
+experiments/dp_opt/.workaware-profile-stage/

@@ -1,0 +1,13 @@
+{
+  "counts": [[64, 63], [64, 64]],
+  "capacity_gib": [11, 11],
+  "initial_gib": [8, 8],
+  "new_gib": 6,
+  "imbalance_cost_s": [0.011715952137782435, 0.011715952137782435],
+  "movable": [
+    {"id": "A0", "model": 0, "source": 0, "memory_gib": 1, "move_cost_s": 0.042},
+    {"id": "A1", "model": 0, "source": 1, "memory_gib": 1, "move_cost_s": 0.042},
+    {"id": "B0", "model": 1, "source": 0, "memory_gib": 2, "move_cost_s": 0.082},
+    {"id": "B1", "model": 1, "source": 1, "memory_gib": 2, "move_cost_s": 0.082}
+  ]
+}
