@@ -192,3 +192,4 @@ tools/.addlicense.lock
 
 experiments/dp_opt/.workaware-stage/
 experiments/dp_opt/.workaware-profile-stage/
+experiments/dp_opt/.public-source-stage*/

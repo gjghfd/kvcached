@@ -128,7 +128,7 @@ def test_fair_baseline_blocks_new_competitors_without_migration_or_pause(modules
                            prepared_prompts={"16": [1] * 16})
 
     async def run():
-        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], concurrent_admission=True,
+        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], notify_release=AsyncMock(), concurrent_admission=True,
                                      snapshots=AsyncMock(return_value=observed), try_direct_admission=direct,
                                      schedule_admission=AsyncMock(), pause=AsyncMock())
         result = await runner.run_trace([None, None], controller, args, trace, None, policy, 0, tmp_path / "trial")
@@ -195,7 +195,7 @@ def test_pending_allocator_reservation_does_not_release_fairness_on_submission(m
                            prepared_prompts={"16": [1] * 16})
 
     async def run():
-        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], concurrent_admission=True,
+        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], notify_release=AsyncMock(), concurrent_admission=True,
                                      snapshots=AsyncMock(return_value=observed), try_direct_admission=direct,
                                      check_capacity=AsyncMock(), schedule_admission=AsyncMock())
         return await runner.run_trace([None, None], controller, args, {"duration_s": .15, "requests": marks},

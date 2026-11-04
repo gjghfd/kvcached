@@ -5,7 +5,14 @@ import math
 import statistics
 from pathlib import Path
 
+from live_trace import request_provenance
 from verify_benefit import percentile, verify_ownership
+
+
+def verify_request_provenance(request, mark):
+    for name, value in request_provenance(mark).items():
+        if name not in request or request[name] != value:
+            raise ValueError("Request source provenance differs from frozen mark: " + name)
 
 
 def capture_entries(value):
@@ -17,6 +24,13 @@ def capture_entries(value):
 
 
 def request_metrics(requests, origin, duration, deadline):
+    if not requests:
+        return {"mean_queue_s": None, "p95_queue_s": None, "p99_queue_s": None, "mean_ttft_s": None,
+                "p95_ttft_s": None, "p99_ttft_s": None, "mean_latency_s": None, "p99_latency_s": None,
+                "mean_tpot_s": None, "makespan_s": None, "drain_s": 0, "arrival_window_s": duration,
+                "deadline_s": deadline, "deadline_met_requests": 0, "deadline_goodput_req_s": 0,
+                "completed_requests": 0, "completed_within_arrival_window": 0, "output_tokens": 0,
+                "output_tokens_per_complete_drain_s": None}
     queue = [request.get("reserved_at", request["submitted_at"]) - request["arrived_at"] for request in requests]
     ttft = [request["first_token_at"] - request["arrived_at"] for request in requests]
     latency = [request["completed_at"] - request["arrived_at"] for request in requests]
@@ -40,12 +54,16 @@ def request_metrics(requests, origin, duration, deadline):
 def control_metrics(decisions):
     direct = [decision for decision in decisions if decision["path"] == "direct_fastpath"]
     staged = [decision for decision in decisions if decision["path"] == "blocked_staged_ilp"]
+    random = [decision for decision in decisions if decision["path"] == "blocked_random_greedy"]
     rebalances = [decision for decision in decisions if decision["path"] == "release_rebalance_ilp"]
-    controlled = staged + rebalances
+    controlled = staged + random + rebalances
     return {"direct_admissions": len(direct),
             "direct_control_s": sum(decision["end_to_end_control_s"] for decision in direct),
             "staged_attempts": len(staged), "staged_admissions": sum(decision["admitted"] for decision in staged),
             "staged_control_s": sum(decision["end_to_end_control_s"] for decision in staged),
+            "random_greedy_attempts": len(random),
+            "random_greedy_admissions": sum(decision["admitted"] for decision in random),
+            "random_greedy_control_s": sum(decision["end_to_end_control_s"] for decision in random),
             "pause_call_s": sum(decision["pause_call_s"] for decision in controlled),
             "solve_s": sum(decision["solve_s"] for decision in controlled),
             "preplan_s": sum(decision.get("preplan_s", 0) for decision in controlled),
@@ -72,7 +90,7 @@ def paired_summary_comparisons(trials, baselines, treatment):
             before, after = by_policy[policy], by_policy[treatment]
             comparison = {name + "_reduction_fraction": 1 - after[name] / before[name]
                           for name in ("mean_queue_s", "p99_queue_s", "mean_ttft_s", "mean_latency_s", "drain_s")
-                          if before[name] > 0}
+                          if before[name] is not None and after[name] is not None and before[name] > 0}
             comparison.update({"repeat": repeat, "baseline": policy, "treatment": treatment,
                                "deadline_met_request_difference": after["deadline_met_requests"] - before["deadline_met_requests"]})
             comparisons.append(comparison)
@@ -115,10 +133,21 @@ def verify_prompt_bank(trace, prompt_bank):
     prompts = json.loads(payload)["prompts"]
     for mark in real_marks:
         entry = prompts.get(mark["prompt_key"])
-        if (entry is None or len(entry["token_ids"]) != mark["prompt_tokens"]
-                or entry["prompt_tokens"] != mark["prompt_tokens"]
-                or entry["traj_id"] != mark["source_traj_id"]):
-            raise ValueError("Real prompt length or trajectory source differs")
+        if (not isinstance(entry, dict) or not isinstance(entry.get("token_ids"), list)
+                or len(entry["token_ids"]) != mark["prompt_tokens"]
+                or entry.get("prompt_tokens") != mark["prompt_tokens"]):
+            raise ValueError("Real prompt length differs from frozen bank")
+        if "source_traj_id" in mark:
+            if entry.get("traj_id") != mark["source_traj_id"]:
+                raise ValueError("Real prompt trajectory source differs")
+            continue
+        fields = ("dataset", "revision", "source_file", "source_row", "assistant_index",
+                  "source_sha256", "selection_sha256", "original_response_sha256",
+                  "original_output_tokens")
+        if ("traj_id" in entry or any(name not in entry or name not in mark
+                                     or entry[name] != mark[name] for name in fields)
+                or mark.get("output_tokens") != entry["original_output_tokens"]):
+            raise ValueError("Public prompt source or original response length differs from frozen bank")
 
 
 def verify_journals(directory):
@@ -201,12 +230,20 @@ def verify(root, prompt_bank=None):
         if (config["workaware_fit_data"] != calibrated
                 or read("runtime-control.json").get("workaware_rebalance_policy") != "kv_only_workaware"):
             raise ValueError("Workaware serving differs from independently verified frozen calibration")
-        verify_runtime(root)
+        runtime = verify_runtime(root)
+        optimizer = config.get("workaware_optimizer", "point")
+        if (optimizer not in ("point", "robust")
+                or runtime.get("workaware_optimizer", "point") != optimizer
+                or read("runtime-control.json").get("workaware_optimizer", "point") != optimizer):
+            raise ValueError("Workaware optimizer differs across configuration, control and launch source archive")
     order = read("order.json")
     expected_trials = {(repeat, policy) for repeat in range(config["repeats"]) for policy in config["policies"]}
     if len(order) != len(expected_trials) or {(item["repeat"], item["policy"]) for item in order} != expected_trials:
         raise ValueError("Missing, duplicate or unknown policy trial")
     marks = {request["request_id"]: request for request in trace["requests"]}
+    if (type(trace.get("allow_empty_tenants", False)) is not bool
+            or (not marks and not trace.get("allow_empty_tenants", False))):
+        raise ValueError("An empty trace must explicitly retain zero-arrival realizations")
     if (len(marks) != len(trace["requests"]) or config["max_model_len"] <= 0
             or trace.get("max_model_len", config["max_model_len"]) > config["max_model_len"]
             or any(mark["prompt_tokens"] + mark["output_tokens"] > config["max_model_len"]
@@ -250,6 +287,8 @@ def verify(root, prompt_bank=None):
                 raise ValueError("Invalid request timing")
             if not request["submitted_at"] <= request.get("reserved_at", request["submitted_at"]) <= request["first_token_at"]:
                 raise ValueError("Invalid full KV reservation timing")
+            if "source_row" in mark:
+                verify_request_provenance(request, mark)
         token_maps[(item["repeat"], item["policy"])] = {identifier: request["token_ids"] for identifier, request in by_id.items()}
         if summary["policy"] != item["policy"] or summary["repeat"] != item["repeat"]:
             raise ValueError("Trial summary identity differs")
@@ -268,6 +307,30 @@ def verify(root, prompt_bank=None):
                 raise ValueError("Sampled mapped budget exceeded")
         decisions = json.loads((directory / "decisions.json").read_text())
         migrations = json.loads((directory / "migrations.json").read_text())
+        if item["policy"] == "random_no_return":
+            from random_placement import request_placement_seed, select_random_candidate
+
+            if (read("runtime-control.json").get("random_migration_policy") != "random_no_return"
+                    or workload.get("placement_seed") != config["seed"]
+                    or summary.get("release_rebalance")
+                    or summary.get("ilp_attempts") != 0):
+                raise ValueError("Random baseline must record its seed and never run ILP or release rebalance")
+            for decision in decisions:
+                if decision["path"] in ("release_rebalance_ilp", "blocked_staged_ilp"):
+                    raise ValueError("Random baseline ran an optimizing or return planner")
+                if decision["path"] != "blocked_random_greedy":
+                    continue
+                original_plan = (decision.get("preplan") or {}).get("random_plan") or decision.get("plan")
+                if original_plan is None:
+                    raise ValueError("Random baseline lacks its original seeded choice")
+                seed = request_placement_seed(config["seed"], item["repeat"], decision["request_id"])
+                winner, selection = select_random_candidate(original_plan["candidates"], seed)
+                if original_plan.get("random_selection") != selection or original_plan.get("winner") != winner:
+                    raise ValueError("Random rank draw differs from the frozen request seed")
+                if decision.get("winner") is not None and winner is not None and decision["winner"]["target"] != winner["target"]:
+                    raise ValueError("Random baseline changed its selected rank after revalidation")
+                if any(move["source"] != decision["winner"]["target"] for move in decision["moves"]):
+                    raise ValueError("Random baseline migration did not evacuate its selected rank")
         if item["policy"] == "no_move_fair":
             from verify_queue_fairness import verify as verify_fairness
 
@@ -280,6 +343,8 @@ def verify(root, prompt_bank=None):
         totals = {"moves": len(migrations), "migration_kv_bytes": sum(move["kv_bytes"] for move in migrations),
                   "control_s": sum(decision["end_to_end_control_s"] for decision in decisions),
                   "ilp_attempts": sum(decision["path"] == "blocked_staged_ilp" for decision in decisions)}
+        if "random_greedy_attempts" in summary:
+            totals["random_greedy_attempts"] = sum(decision["path"] == "blocked_random_greedy" for decision in decisions)
         if "control_s_including_preplan" in summary:
             totals["control_s_including_preplan"] = sum(decision["end_to_end_control_s"]
                                                        + decision.get("preplan_s", 0) for decision in decisions)
@@ -343,8 +408,11 @@ def verify(root, prompt_bank=None):
         captures = json.loads((directory / "captures.json").read_text())
         if len(captures) != 2 or any(len(ranks) != 2 for ranks in captures):
             raise ValueError("Missing tenant/rank capture evidence")
-        for ranks in captures:
+        for model, ranks in enumerate(captures):
             for capture in ranks:
+                if not any(mark["model"] == model for mark in marks.values()):
+                    capture_entries(capture)
+                    continue
                 if not any("FULL" in entry["mode"] and entry["steps"] > 0 for entry in capture_entries(capture)):
                     raise ValueError("No real CUDA graph decode evidence on a tenant/rank")
         trials.append({**summary, "control_breakdown": control_metrics(decisions),

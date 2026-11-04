@@ -9,6 +9,7 @@ from pathlib import Path
 from ilp_reference import enumerate_targets, replay_candidate
 from motivation import graph_padding
 from calibrated_cost import SPARSE_CAPTURE_SIZES
+from random_placement import random_target_plan, select_random_candidate
 
 
 def snapshot_model(rank_snapshots, arriving_tokens, model_index, snapshot):
@@ -77,7 +78,8 @@ def stable_ownership(observations):
 def preplan_metadata(prepared):
     return {"settings": prepared["settings"], "admission_generation": prepared["admission_generation"],
             "elapsed_s": prepared["elapsed_s"], "horizon_steps": prepared["horizon_steps"],
-            "active_plus_incoming": prepared["active_plus_incoming"], "scope": prepared["scope"]}
+            "active_plus_incoming": prepared["active_plus_incoming"], "scope": prepared["scope"],
+            "random_plan": prepared["plan"] if prepared["settings"][3] == "random_no_return" else None}
 
 
 def admission_planning_snapshot(observed, arriving_model, total_tokens, output_tokens, budgets_gib,
@@ -118,8 +120,10 @@ def admission_planning_snapshot(observed, arriving_model, total_tokens, output_t
     snapshot["movable"] = [request for request in snapshot["movable"] if request["id"] in selected_ids]
     if policy == "own_model":
         snapshot["movable"] = [request for request in snapshot["movable"] if request["model"] == 0]
-    if policy == "kv_only":
+    if policy in ("kv_only", "random_no_return"):
         snapshot["performance_cost_tables_s"] = [[0] * len(table) for table in snapshot["performance_cost_tables_s"]]
+        if policy == "random_no_return":
+            snapshot["performance_cost_scope_by_model"] = ["ignored_by_random_admission_baseline"] * 2
     return snapshot, horizon, population
 
 
@@ -173,7 +177,11 @@ def revalidate_prepared_plan(prepared, observed, fit, allow_extrapolation, layou
                                                    "status": "current_direct_allocator_fits"}))
     feasible = [candidate for candidate in replayed if "objective_s" in candidate]
     direct = [candidate for candidate in feasible if not candidate["moves"]]
-    if policy == "kv_only" and direct:
+    selection = None
+    if policy == "random_no_return":
+        chosen = prepared["plan"].get("random_selection", {}).get("selected_target")
+        winner, selection = select_random_candidate(feasible, prepared.get("placement_seed", 0), chosen)
+    elif policy == "kv_only" and direct:
         winner = min(direct, key=lambda candidate: (snapshot["counts"][0][candidate["target"]],
                                                    snapshot["initial_gib"][candidate["target"]], candidate["target"]))
     else:
@@ -181,7 +189,8 @@ def revalidate_prepared_plan(prepared, observed, fit, allow_extrapolation, layou
                                                     candidate["target"])) if feasible else None
     return snapshot, horizon, population, {"status": "revalidated_feasible_not_proven" if winner else "no_feasible_plan",
         "candidates": replayed, "winner": winner, "proven_infeasible": False,
-        "scope": "original_two_target_ILP_candidates_and_current_direct_fits_not_current_global_optimum"}
+        "random_selection": selection,
+        "scope": "original_two_target_candidates_and_current_direct_fits_not_current_global_optimum"}
 
 
 def prepared_candidate_identity(prepared):
@@ -197,7 +206,8 @@ def prepared_candidate_identity(prepared):
                          for rank, observation in enumerate(ranks) for request in observation["requests"]
                          if request["id"] in selected],
             "geometry": [[{name: observation[name] for name in geometry} for observation in ranks]
-                         for ranks in prepared["observations"]]}
+                         for ranks in prepared["observations"]],
+            **({"placement_seed": prepared["placement_seed"]} if prepared["settings"][3] == "random_no_return" else {})}
 
 
 def allocation_increment(observation, tokens):
@@ -231,7 +241,7 @@ def select_candidates(snapshot, limit=2):
 
 
 def migration_precheck(observations, model, tokens, budgets, policy, max_moves=2, candidate_limit=2):
-    if policy not in ("own_model", "kv_only", "ilp") or model not in (0, 1):
+    if policy not in ("own_model", "kv_only", "ilp", "random_no_return") or model not in (0, 1):
         raise ValueError("Migration precheck requires a movable policy and valid tenant")
     if (not isinstance(max_moves, int) or isinstance(max_moves, bool) or max_moves < 0
             or not isinstance(tokens, int) or isinstance(tokens, bool) or tokens <= 0
@@ -370,6 +380,7 @@ class PlacementController:
         self.revalidate_prepared = False
         self.model_admission_locks = [asyncio.Lock(), asyncio.Lock()]
         self.model_admission_generations = [0, 0]
+        self.admission_dirty_models = set()
 
     @asynccontextmanager
     async def direct_admission_epoch(self, model, tokens, budgets):
@@ -389,14 +400,15 @@ class PlacementController:
                     generation = self.admission_generation
                     model_generation = self.model_admission_generations[model]
                     cached = self.admission_observations
-                full = refresh_all or cached is None
+                full = refresh_all or cached is None or bool(self.admission_dirty_models - {model})
                 observed = await self.snapshots() if full else list(await asyncio.gather(*[
                     self.call(model, rank, "placement_snapshot") for rank in (0, 1)]))
                 await self.lock.acquire()
                 try:
                     if ((full and generation != self.admission_generation)
                             or (not full and (model_generation != self.model_admission_generations[model]
-                                             or self.admission_observations is None))):
+                                             or self.admission_observations is None
+                                             or bool(self.admission_dirty_models - {model})))):
                         continue
                     if full:
                         observations, scope = observed, "fresh_all_tenants"
@@ -404,6 +416,10 @@ class PlacementController:
                         observations = [list(ranks) for ranks in self.admission_observations]
                         observations[model] = observed
                         scope = "fresh_arriving_tenant_cached_other_upper_bounds_no_independent_growth"
+                    if full:
+                        self.admission_dirty_models.clear()
+                    else:
+                        self.admission_dirty_models.discard(model)
                     used, candidates = admission_candidates(observations, model, tokens, budgets)
                     if not candidates and not full:
                         refresh_all = True
@@ -414,11 +430,15 @@ class PlacementController:
                     self.lock.release()
 
     async def admission_snapshot(self, model, refresh_all=False):
-        if not self.rank_local_admission or refresh_all or self.admission_observations is None:
-            return await self.snapshots(), "fresh_all_tenants"
+        if (not self.rank_local_admission or refresh_all or self.admission_observations is None
+                or bool(self.admission_dirty_models - {model})):
+            observations = await self.snapshots()
+            self.admission_dirty_models.clear()
+            return observations, "fresh_all_tenants"
         current = await asyncio.gather(*[self.call(model, rank, "placement_snapshot") for rank in (0, 1)])
         observations = [list(ranks) for ranks in self.admission_observations]
         observations[model] = list(current)
+        self.admission_dirty_models.discard(model)
         return observations, "fresh_arriving_tenant_cached_other_upper_bounds_no_independent_growth"
 
     async def monitor_snapshot(self):
@@ -431,6 +451,14 @@ class PlacementController:
                 "admission_generation_after": after_generation,
                 "admission_stable_across_observation": before_generation == after_generation,
                 "scope": "query_outside_control_lock_accept_only_same_admission_epoch_no_independent_growth"}
+
+    async def notify_release(self, model):
+        if type(model) is not int or model not in (0, 1):
+            raise ValueError("Release requires a known tenant")
+        async with self.lock:
+            self.admission_dirty_models.add(model)
+            self.admission_generation += 1
+            self.model_admission_generations[model] += 1
 
     async def call(self, model, rank, method, *args):
         client = self.engines[model].engine_core
@@ -558,8 +586,8 @@ class PlacementController:
                                  arriving_model=0, max_moves=2, candidate_limit=2, move_fixed_s=0.475,
                                  move_bandwidth_gib_s=1, solver_limit_s=1, allow_migrations=True,
                                  wait_cost_s=None, wait_fixed_cost_s=0, prepared=None, future_transaction_fixed_s=0,
-                                 wait_recheck_options=None):
-        if policy not in ("no_move", "own_model", "kv_only", "ilp") or arriving_model not in (0, 1):
+                                 wait_recheck_options=None, placement_seed=0):
+        if policy not in ("no_move", "own_model", "kv_only", "ilp", "random_no_return") or arriving_model not in (0, 1):
             raise ValueError("Unknown policy or arriving model")
         if (any(not math.isfinite(value) for value in (prompt_tokens, output_tokens, move_bandwidth_gib_s,
                                                        solver_limit_s, move_fixed_s))
@@ -594,7 +622,8 @@ class PlacementController:
 
             if prepared is not None:
                 current = await self.snapshots()
-                if (prepared["settings"] != [prompt_tokens, output_tokens, list(budgets_gib), policy,
+                if ((policy == "random_no_return" and prepared.get("placement_seed", 0) != placement_seed)
+                        or prepared["settings"] != [prompt_tokens, output_tokens, list(budgets_gib), policy,
                                                      arriving_model, max_moves, candidate_limit,
                                                      move_fixed_s, move_bandwidth_gib_s, solver_limit_s]
                         or (not self.revalidate_prepared and (prepared["admission_generation"] != self.admission_generation
@@ -694,12 +723,21 @@ class PlacementController:
                         candidates.append(plan["winner"])
                 elif policy != "no_move" and allow_migrations:
                     solve_started = time.monotonic()
-                    plan = await asyncio.to_thread(enumerate_targets, snapshot, max_moves=max_moves,
-                                                   time_limit_s=solver_limit_s)
+                    if policy == "random_no_return":
+                        plan = await asyncio.to_thread(random_target_plan, snapshot, max_moves=max_moves,
+                                                       seed=placement_seed)
+                    else:
+                        plan = await asyncio.to_thread(enumerate_targets, snapshot, max_moves=max_moves,
+                                                       time_limit_s=solver_limit_s)
                     solve_s = time.monotonic() - solve_started
                     if plan["winner"] is not None:
                         candidates.append(plan["winner"])
-                if policy in ("no_move", "kv_only"):
+                if policy == "random_no_return":
+                    selected = plan.get("random_selection", {}).get("selected_target") if plan else None
+                    winner, selection = select_random_candidate(candidates, placement_seed, selected)
+                    if plan is not None:
+                        plan["execution_random_selection"] = selection
+                elif policy in ("no_move", "kv_only"):
                     direct = [candidate for candidate in candidates if not candidate["moves"]]
                     if direct:
                         winner = min(direct, key=lambda candidate: (snapshot["counts"][0][candidate["target"]],
@@ -775,7 +813,9 @@ class PlacementController:
                           "preplan_s": prepared["elapsed_s"] if prepared else 0,
                           "pause_receipts": pause_receipts,
                           "transaction_s_before_resume": time.monotonic() - started, "horizon_steps": horizon,
-                          "cost_scope": ("small_population_Conv_lookup_with_explicit_surrogate_fallback_not_Code_prefill_joint_cost"
+                          "cost_scope": ("random_feasible_DP_greedy_ignores_performance_objective_no_ILP"
+                                         if policy == "random_no_return" else
+                                         "small_population_Conv_lookup_with_explicit_surrogate_fallback_not_Code_prefill_joint_cost"
                                          if self.layout_lookup is not None else
                                          "single_model_surrogate_extrapolated_measured_fixed_latency_assumed_bandwidth"),
                           "candidate_scope": f"at_most_{candidate_limit}_requests_per_model_rank_not_global_optimum"}
@@ -795,8 +835,8 @@ class PlacementController:
 
     async def prepare_admission(self, prompt_tokens, output_tokens, budgets_gib, policy="ilp",
                                 arriving_model=0, max_moves=2, candidate_limit=2, move_fixed_s=.475,
-                                move_bandwidth_gib_s=1, solver_limit_s=1):
-        if (policy not in ("own_model", "kv_only", "ilp") or arriving_model not in (0, 1)
+                                move_bandwidth_gib_s=1, solver_limit_s=1, placement_seed=0):
+        if (policy not in ("own_model", "kv_only", "ilp", "random_no_return") or arriving_model not in (0, 1)
                 or len(budgets_gib) != 2 or any(not math.isfinite(value) or value <= 0 for value in budgets_gib)
                 or any(not isinstance(value, int) or isinstance(value, bool) or value <= 0
                        for value in (prompt_tokens, output_tokens, candidate_limit))
@@ -812,13 +852,17 @@ class PlacementController:
             observed, arriving_model, prompt_tokens + output_tokens, output_tokens, budgets_gib,
             self.fit, self.allow_extrapolation, policy, candidate_limit, move_fixed_s, move_bandwidth_gib_s,
             self.layout_lookup)
-        plan = await asyncio.to_thread(enumerate_targets, snapshot, max_moves=max_moves, time_limit_s=solver_limit_s)
+        if policy == "random_no_return":
+            plan = await asyncio.to_thread(random_target_plan, snapshot, max_moves=max_moves, seed=placement_seed)
+        else:
+            plan = await asyncio.to_thread(enumerate_targets, snapshot, max_moves=max_moves, time_limit_s=solver_limit_s)
         return {"settings": [prompt_tokens, output_tokens, list(budgets_gib), policy, arriving_model,
                              max_moves, candidate_limit, move_fixed_s, move_bandwidth_gib_s, solver_limit_s],
                 "admission_generation": generation, "ownership": stable_ownership(observed),
                 "observations": observed, "snapshot": snapshot, "plan": plan, "horizon_steps": horizon,
                 "active_plus_incoming": population, "elapsed_s": time.monotonic() - started,
-                "scope": "decode_continues_during_ILP_revalidate_before_and_after_default32_boundary"}
+                "placement_seed": placement_seed,
+                "scope": "decode_continues_during_planning_revalidate_before_and_after_default32_boundary"}
 
     async def migrate(self, transaction, request, budgets_gib=None):
         model, source = request["model"], request["source"]

@@ -15,10 +15,11 @@ from live_benefit import capture_control, percentile, stream, wait_empty, wait_r
 from live_controller import PlacementController, allocation_increment, migration_precheck, stable_ownership, wait_migration_precheck
 from queue_fairness import DEFAULT_QUEUE_THRESHOLD_S, FairAdmissionGate
 from live_rebalance import ReleaseRebalancer
+from random_placement import request_placement_seed
 
 
 POLICIES = ("no_move", "own_model", "kv_only", "ilp")
-TRACE_POLICIES = (*POLICIES, "no_move_fair", "kv_only_rebalance", "kv_only_amortized", "kv_only_headroom", "kv_only_workaware")
+TRACE_POLICIES = (*POLICIES, "no_move_fair", "random_no_return", "kv_only_rebalance", "kv_only_amortized", "kv_only_headroom", "kv_only_workaware")
 AMORTIZED_RUNTIME_SOURCES = (
     "amortized_rebalance.py", "ilp_reference.py", "live_controller.py", "live_scheduler.py",
     "live_trace.py", "live_rebalance.py", "verify_trace.py", "verify_rebalance.py",
@@ -43,6 +44,12 @@ async def append_record(path, value):
             output.write(json.dumps(value, separators=(",", ":")) + "\n")
 
     await asyncio.to_thread(write)
+
+
+def request_provenance(mark):
+    fields = {"dataset", "revision", "assistant_index", "selection_sha256",
+              "original_output_tokens", "original_response_sha256", "original_source_fragment"}
+    return {name: value for name, value in mark.items() if name.startswith("source_") or name in fields}
 
 
 async def run_capacity_pilot(engines, controller, args, trace, tokenizer):
@@ -290,10 +297,11 @@ async def run_rate_calibration(engines, controller, args, trace, tokenizer):
     save(args.output / "summary.json", {"status": "calibration_passed"})
 
 
-def summarize_trace(requests, origin, duration, deadline):
-    if not requests or len({request["request_id"] for request in requests}) != len(requests):
+def summarize_trace(requests, origin, duration, deadline, allow_empty=False):
+    if (type(allow_empty) is not bool or (not requests and not allow_empty)
+            or len({request["request_id"] for request in requests}) != len(requests)):
         raise ValueError("Require unique completed trace requests")
-    finish = max(request["completed_at"] for request in requests)
+    finish = max((request["completed_at"] for request in requests), default=origin)
     queue = [request.get("reserved_at", request["submitted_at"]) - request["arrived_at"] for request in requests]
     ttft = [request["first_token_at"] - request["arrived_at"] for request in requests]
     latency = [request["completed_at"] - request["arrived_at"] for request in requests]
@@ -302,16 +310,17 @@ def summarize_trace(requests, origin, duration, deadline):
     if any(value < 0 for value in queue + ttft + latency):
         raise ValueError("Trace timing precedes frozen arrival")
     return {"completed_requests": len(requests), "output_tokens": sum(len(request["token_ids"]) for request in requests),
-            "makespan_s": finish - origin, "drain_s": max(0, finish - origin - duration),
-            "arrival_window_s": duration, "mean_queue_s": statistics.mean(queue),
-            "p95_queue_s": percentile(queue, .95), "p99_queue_s": percentile(queue, .99),
-            "mean_ttft_s": statistics.mean(ttft), "p95_ttft_s": percentile(ttft, .95),
-            "p99_ttft_s": percentile(ttft, .99), "mean_latency_s": statistics.mean(latency),
-            "p99_latency_s": percentile(latency, .99), "mean_tpot_s": statistics.mean(tpot) if tpot else None,
+            "makespan_s": finish - origin if requests else None, "drain_s": max(0, finish - origin - duration),
+            "arrival_window_s": duration, "mean_queue_s": statistics.mean(queue) if queue else None,
+            "p95_queue_s": percentile(queue, .95) if queue else None, "p99_queue_s": percentile(queue, .99) if queue else None,
+            "mean_ttft_s": statistics.mean(ttft) if ttft else None, "p95_ttft_s": percentile(ttft, .95) if ttft else None,
+            "p99_ttft_s": percentile(ttft, .99) if ttft else None, "mean_latency_s": statistics.mean(latency) if latency else None,
+            "p99_latency_s": percentile(latency, .99) if latency else None, "mean_tpot_s": statistics.mean(tpot) if tpot else None,
             "deadline_s": deadline, "deadline_met_requests": sum(value <= deadline for value in latency),
             "deadline_goodput_req_s": sum(value <= deadline for value in latency) / duration,
             "completed_within_arrival_window": sum(request["completed_at"] <= origin + duration for request in requests),
-            "output_tokens_per_complete_drain_s": sum(len(request["token_ids"]) for request in requests) / (finish - origin)}
+            "output_tokens_per_complete_drain_s": sum(len(request["token_ids"]) for request in requests) / (finish - origin)
+                                                  if requests else None}
 
 
 async def run_trace(engines, controller, args, trace, tokenizer, policy, repeat, root):
@@ -363,6 +372,7 @@ async def run_trace(engines, controller, args, trace, tokenizer, policy, repeat,
     journal_locks = {name: asyncio.Lock() for name in ("requests", "decisions", "population", "monitor-transitions", "wait-prechecks", "fairness-events", "headroom-arrivals")}
     prompts = getattr(args, "prepared_prompts", None) or prepare_prompts(trace, tokenizer)
     save(root / "workload.json", {"origin": origin, "policy": policy, "repeat": repeat,
+                                  **({"placement_seed": getattr(args, "seed", 42)} if policy == "random_no_return" else {}),
                                   "capacity_gib": budgets, "trace_sha256": hashlib.sha256(
                                       (json.dumps(trace, indent=2) + "\n").encode()).hexdigest(),
                                   "duration_s": trace["duration_s"], "requests": trace["requests"]})
@@ -401,14 +411,16 @@ async def run_trace(engines, controller, args, trace, tokenizer, policy, repeat,
         mark = entry["mark"]
         try:
             result = await stream_task
+            await controller.notify_release(mark["model"])
             reservation = await entry["reservation_future"]
             if isinstance(reservation, dict):
                 result.update({"reserved_at": reservation["reserved_at"],
                                "reservation_time_source": reservation["reservation_time_source"]})
                 if "reservation_observed_at" in reservation:
                     result["reservation_observed_at"] = reservation["reservation_observed_at"]
-            result.update({"source_fragment": mark["source_fragment"], "source_internal_row": mark["source_internal_row"],
-                           "arrival_offset_s": mark["arrival_s"], "arrival_dispatch_lag_s": entry["arrival_dispatch_lag_s"]})
+            result.update(request_provenance(mark))
+            result.update({"arrival_offset_s": mark["arrival_s"],
+                           "arrival_dispatch_lag_s": entry["arrival_dispatch_lag_s"]})
             if "prompt_key" in mark:
                 result["prompt_key"] = mark["prompt_key"]
             results.append(result)
@@ -518,6 +530,8 @@ async def run_trace(engines, controller, args, trace, tokenizer, policy, repeat,
                         attempted_states.add(state)
                         planning_started = time.monotonic()
                         prepared = None
+                        placement_options = ({"placement_seed": request_placement_seed(
+                            getattr(args, "seed", 42), repeat, mark["request_id"])} if policy == "random_no_return" else {})
                         if getattr(args, "preplan", False):
                             prepared = await controller.prepare_admission(
                                 mark["prompt_tokens"], mark["output_tokens"], budgets, policy=admission_policy,
@@ -525,12 +539,13 @@ async def run_trace(engines, controller, args, trace, tokenizer, policy, repeat,
                                 candidate_limit=args.candidate_limit, solver_limit_s=args.solver_limit_s,
                                 move_fixed_s=args.move_fixed_s,
                                 move_bandwidth_gib_s=1 / args.wait_copy_seconds_per_gib if wait_gate is not None
-                                else getattr(args, "move_bandwidth_gib_s", 1))
+                                else getattr(args, "move_bandwidth_gib_s", 1), **placement_options)
                         decision = await controller.schedule_admission(
                             mark["prompt_tokens"], mark["output_tokens"], budgets, admit, policy=admission_policy,
                             arriving_model=mark["model"], max_moves=args.max_moves,
                             candidate_limit=args.candidate_limit, solver_limit_s=args.solver_limit_s,
                             move_fixed_s=args.move_fixed_s,
+                            **placement_options,
                             **({"move_bandwidth_gib_s": getattr(args, "move_bandwidth_gib_s", 1)}
                                if wait_gate is None else {}),
                             **({"prepared": prepared} if prepared is not None else {}),
@@ -550,7 +565,7 @@ async def run_trace(engines, controller, args, trace, tokenizer, policy, repeat,
                         planning_not_before[mark["model"]] = time.monotonic() + max(
                             getattr(args, "planning_retry_min_s", 2),
                             planning_elapsed * getattr(args, "planning_retry_cost_factor", 4))
-                        decision["path"] = "blocked_staged_ilp"
+                        decision["path"] = "blocked_random_greedy" if policy == "random_no_return" else "blocked_staged_ilp"
                         decision["no_pause_precheck"] = precheck
                         decision["wait_cost_precheck"] = wait_gate
                     else:
@@ -560,7 +575,8 @@ async def run_trace(engines, controller, args, trace, tokenizer, policy, repeat,
                     decision["path"] = ("direct_fastpath" if decision["admitted"] else
                                         "direct_allocator_wait" if decision.get("submitted", False) else
                                         "wait_capacity_or_prefill")
-                if decision["admitted"] or decision.get("submitted", False) or decision["path"] == "blocked_staged_ilp":
+                if (decision["admitted"] or decision.get("submitted", False)
+                        or decision["path"] in ("blocked_staged_ilp", "blocked_random_greedy")):
                     decision.update({"request_id": mark["request_id"], "elapsed_from_arrival_s": time.monotonic() - entry["arrived_at"],
                                      "policy": policy})
                     decisions.append(decision)
@@ -573,7 +589,7 @@ async def run_trace(engines, controller, args, trace, tokenizer, policy, repeat,
                 await asyncio.sleep(args.queue_poll_s)
 
     async def monitor():
-        while not arrivals or any(not task.done() for task in arrivals) or time.monotonic() < origin + trace["duration_s"]:
+        while any(not task.done() for task in arrivals) or time.monotonic() < origin + trace["duration_s"]:
             monitoring = None
             if getattr(controller, "rank_local_admission", False):
                 monitoring = await controller.monitor_snapshot()
@@ -643,6 +659,7 @@ async def run_trace(engines, controller, args, trace, tokenizer, policy, repeat,
                 pause_fixed_s=args.move_fixed_s if pause_fixed is None else pause_fixed,
                 min_gain_s=getattr(args, "rebalance_min_gain_s", 1), admission_busy=admission_busy,
                 workaware_fit=getattr(args, "workaware_fit_data", None),
+                workaware_optimizer=getattr(args, "workaware_optimizer", "point") if policy == "kv_only_workaware" else "point",
                 **({"balance_ledger": balance_ledger} if balance_ledger is not None else {}))
 
         async def record_rebalance(decision):
@@ -672,13 +689,15 @@ async def run_trace(engines, controller, args, trace, tokenizer, policy, repeat,
                                timeout=trace["duration_s"] + args.request_timeout_s * 2)
         await wait_empty(controller)
         captures = await capture_control(controller, "stop")
-        summary = summarize_trace(results, origin, trace["duration_s"], args.deadline_s)
+        summary = summarize_trace(results, origin, trace["duration_s"], args.deadline_s,
+                                  allow_empty=trace.get("allow_empty_tenants", False))
         summary.update({"policy": policy, "repeat": repeat, "moves": len(controller.events),
                         "migration_kv_bytes": sum(event["kv_bytes"] for event in controller.events),
                         "control_s": sum(decision["end_to_end_control_s"] for decision in decisions),
                         "control_s_including_preplan": sum(decision["end_to_end_control_s"]
                                                           + decision.get("preplan_s", 0) for decision in decisions),
                         "ilp_attempts": sum(decision["path"] == "blocked_staged_ilp" for decision in decisions),
+                        "random_greedy_attempts": sum(decision["path"] == "blocked_random_greedy" for decision in decisions),
                         "no_pause_planning_prechecks": planning_prechecks})
         summary["wait_cost_prechecks"] = wait_prechecks
         if rebalancer is not None:
@@ -722,18 +741,20 @@ async def run(args):
     if trace["max_model_len"] > args.max_model_len:
         raise ValueError("Trace exceeds engine max length")
     args.output.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "workaware_calibration_plan", None) is not None:
+        from workaware_calibration_plan import screen_plan
+
+        args.workaware_case_plan = json.loads(args.workaware_calibration_plan.read_text())
+        screen_plan(args.workaware_case_plan)
     if getattr(args, "workaware_fit", None) is not None:
-        from workaware_pilot import SOURCE_FILES, load_verified_fit
+        from workaware_pilot import load_verified_fit
+        from workaware_profile_bundle import archive_sources
 
         args.workaware_fit_data = load_verified_fit(args.workaware_fit, args.workaware_fit_sha256,
                                                      args.workaware_source_root)
         shutil.copy2(args.workaware_fit, args.output / "workaware-fit.json")
         source_archive = args.output / "workaware-cost-source"
-        source_archive.mkdir()
-        for name in SOURCE_FILES:
-            destination = source_archive / name
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(args.workaware_source_root / name, destination)
+        archive_sources(args.workaware_source_root, source_archive, args.workaware_fit_data)
     layout_lookup = None
     if getattr(args, "layout_cost_lookup", None) is not None:
         from layout_cost_pilot import LOOKUP_SOURCE_FILES, load_verified_lookup
@@ -767,20 +788,23 @@ async def run(args):
     if "kv_only_workaware" in args.policies or getattr(args, "workaware_cadence_pilot", False):
         from workaware_evidence import archive_runtime
 
-        archive_runtime(args.output)
+        archive_runtime(args.output, optimizer=getattr(args, "workaware_optimizer", "point"))
     save(args.output / "runtime-control.json", {"dp_pause_sync_interval": int(os.environ.get("DP_OPT_PAUSE_SYNC_INTERVAL", "32")),
+                                               "workaware_optimizer": getattr(args, "workaware_optimizer", "point"),
                                                "same_interval_for_all_policies": True,
                                                "idle_rank_expert_execution_not_disabled": True,
                                                "admission": "centralized_per_tenant_FIFO_directfastpath_allocator_queue",
                                                "queue_metric": "full_KV_reservation_time_minus_frozen_arrival",
                                                "rank_local_admission": os.environ.get("DP_OPT_RANK_LOCAL_ADMISSION") == "1",
                                                "concurrent_admission": os.environ.get("DP_OPT_CONCURRENT_ADMISSION") == "1",
+                                               "release_observations": "completion_invalidates_released_tenant_cache_and_inflight_epoch",
                                                "migration_gate": "global_free_all_decode_no_pause_bounded_source_release_then_frozen_recheck",
                                                "planning_retry_min_s": args.planning_retry_min_s,
                                                "planning_retry_cost_factor": args.planning_retry_cost_factor,
                                                "wait_aware_ilp": getattr(args, "wait_aware", False),
                                                "preplan_enabled": getattr(args, "preplan", False),
                                                "candidate_revalidation_enabled": getattr(args, "revalidate_prepared", False),
+                                               "random_migration_policy": "random_no_return" if "random_no_return" in args.policies else None,
                                                "release_rebalance_policy": "kv_only_rebalance" if "kv_only_rebalance" in args.policies else None,
                                                "amortized_rebalance_policy": "kv_only_amortized" if "kv_only_amortized" in args.policies else None,
                                                "headroom_rebalance_policy": "kv_only_headroom" if "kv_only_headroom" in args.policies else None,
@@ -890,7 +914,7 @@ async def run(args):
             return
         reference_marks = sorted(trace["requests"], key=lambda request: request["prompt_tokens"])
         reference_marks = [reference_marks[index] for index in (0, len(reference_marks) // 3,
-                                                               2 * len(reference_marks) // 3, -1)]
+                                                               2 * len(reference_marks) // 3, -1)] if reference_marks else []
         references = []
         for index, mark in enumerate(reference_marks):
             prompt = request_prompt(args.prepared_prompts, mark)
@@ -992,10 +1016,12 @@ def main():
     parser.add_argument("--admission-cost-pilot", action="store_true")
     parser.add_argument("--layout-cost-pilot", action="store_true")
     parser.add_argument("--workaware-cadence-pilot", action="store_true")
+    parser.add_argument("--workaware-calibration-plan", type=Path)
     parser.add_argument("--workaware-fit", type=Path)
     parser.add_argument("--workaware-fit-sha256")
     parser.add_argument("--workaware-source-root", type=Path)
     parser.add_argument("--workaware-rate-priors", nargs=2, type=float)
+    parser.add_argument("--workaware-optimizer", choices=("point", "robust"), default="point")
     parser.add_argument("--layout-cost-lookup", type=Path)
     parser.add_argument("--layout-cost-lookup-sha256")
     parser.add_argument("--layout-cost-source-root", type=Path)
@@ -1020,6 +1046,8 @@ def main():
     parser.add_argument("--wait-copy-seconds-per-gib", type=float, default=5)
     parser.add_argument("--wait-safety-fraction", type=float, default=.8)
     args = parser.parse_args()
+    if args.workaware_optimizer == "robust" and "kv_only_workaware" not in args.policies:
+        parser.error("Robust release optimizer requires the workaware policy")
     if not math.isfinite(args.rebalance_overhead_fraction) or not 0 < args.rebalance_overhead_fraction < 1:
         parser.error("Rebalance overhead fraction must be strictly between zero and one")
     if (not math.isfinite(args.rebalance_headroom_quantile) or not 0 < args.rebalance_headroom_quantile <= 1

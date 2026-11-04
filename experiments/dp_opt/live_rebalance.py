@@ -9,6 +9,15 @@ from live_controller import admission_planning_snapshot, stable_ownership
 def plan_rebalance(observed, budgets, fit, allow_extrapolation, settings, layout_lookup=None,
                    blocking_cost_s=0, phase="before_pause"):
     if settings.get("policy_mode") == "workaware":
+        optimizer = settings.get("workaware_optimizer", "point")
+        if optimizer not in ("point", "robust"):
+            raise ValueError("Unknown workaware release optimizer")
+        if optimizer == "robust":
+            from workaware_robust_adapter import plan
+
+            configured = {name: value for name, value in settings.items() if name != "workaware_optimizer"}
+            return plan(observed, budgets, fit, allow_extrapolation, configured,
+                        layout_lookup, blocking_cost_s, phase)
         from workaware_rebalance import plan_workaware_rebalance
 
         return plan_workaware_rebalance(observed, budgets, fit, allow_extrapolation, settings,
@@ -42,13 +51,15 @@ def plan_rebalance(observed, budgets, fit, allow_extrapolation, settings, layout
 
 async def rebalance_after_release(controller, budgets, max_moves=4, candidate_limit=8,
                                   move_bandwidth_gib_s=1, solver_limit_s=1, pause_fixed_s=.475,
-                                  min_gain_s=1, admission_busy=None, balance_ledger=None, workaware_fit=None):
+                                  min_gain_s=1, admission_busy=None, balance_ledger=None, workaware_fit=None,
+                                  workaware_optimizer="point"):
     from verify_benefit import verify_ownership
 
     settings = {"max_moves": max_moves, "candidate_limit": candidate_limit,
                 "move_bandwidth_gib_s": move_bandwidth_gib_s, "solver_limit_s": solver_limit_s,
                 "pause_fixed_s": pause_fixed_s, "min_gain_s": min_gain_s}
-    if (len(budgets) != 2 or any(not math.isfinite(value) or value <= 0 for value in budgets)
+    if (workaware_optimizer not in ("point", "robust")
+            or len(budgets) != 2 or any(not math.isfinite(value) or value <= 0 for value in budgets)
             or type(max_moves) is not int or max_moves < 0
             or type(candidate_limit) is not int or candidate_limit < 1
             or any(not math.isfinite(value) or value <= 0 for value in (move_bandwidth_gib_s, solver_limit_s))
@@ -58,6 +69,7 @@ async def rebalance_after_release(controller, budgets, max_moves=4, candidate_li
     report = {"path": "release_rebalance_ilp", "started_at": started, "moves": [], "admitted": False, "submitted": False,
               "settings": settings, "pause_call_s": 0, "solve_s": 0, "preplan_s": 0,
               "end_to_end_control_s": 0, "new_request_count": 0,
+              "workaware_optimizer": workaware_optimizer,
               "cost_scope": "remaining_decode_single_model_capture_surrogate_or_Conv_lookup_not_joint_calibration"}
 
     def finish(reason, deferred=False):
@@ -91,6 +103,13 @@ async def rebalance_after_release(controller, budgets, max_moves=4, candidate_li
 
             settings.update({"policy_mode": "workaware", "workaware_profile": evidence["workaware_profile"],
                              "workaware_fit": workaware_fit, "work_interval_steps": 128})
+            if workaware_optimizer == "robust":
+                settings["workaware_optimizer"] = "robust"
+                if (sum(any(rank["requests"] for rank in ranks) for ranks in observed) > 1
+                        or workaware_fit.get("population_profiles", {}).get("status")
+                        != "raw_verified_workaware_population_profiles"):
+                    report["calibration_deferral"] = "Robust recovery requires single-active-tenant population profiles"
+                    return finish("outside_verified_workaware_calibration", True)
             report["cost_scope"] = "remaining_work_graph_context_attention_and_soft_Poisson_headroom"
             try:
                 remaining_segments(observed, workaware_fit)
@@ -151,7 +170,11 @@ async def rebalance_after_release(controller, budgets, max_moves=4, candidate_li
                                            phase="after_pause")
             report["solve_s"] = time.monotonic() - solved_at
             extra_blocking = fresh["active_population"] * report["solve_s"]
-            if settings.get("policy_mode") == "workaware":
+            if settings.get("workaware_optimizer") == "robust":
+                from workaware_robust_adapter import account_paused_controller_planning
+
+                account_paused_controller_planning(fresh, report["solve_s"], blocking)
+            elif settings.get("policy_mode") == "workaware":
                 fresh["gate"]["measured_blocking_so_far_request_s"] = blocking + extra_blocking
             elif balance_ledger is not None:
                 from amortized_rebalance import amortized_gate

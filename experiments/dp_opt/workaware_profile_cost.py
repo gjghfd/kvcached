@@ -33,7 +33,7 @@ def predict_contrast(row, profile, baseline_graph):
             + profile["attention_token_s"] * row["peak_context_delta_tokens"])
 
 
-def fit_profiles(rows):
+def fit_profiles(rows, extended_validation=False):
     grouped = defaultdict(list)
     for row in rows:
         grouped[(row["model"], row["population"])].append(row)
@@ -48,12 +48,27 @@ def fit_profiles(rows):
             trained = fit_rows([row for row in group if row["repeat"] != repeat], baseline)
             residuals.extend(row["measured_cadence_delta_s"] - predict_contrast(row, trained, baseline)
                              for row in group if row["repeat"] == repeat)
+        heldout_domains = {}
+        if extended_validation:
+            for field in ("prompt_tokens", "rank_zero"):
+                values = sorted({row[field] for row in group})
+                if len(values) < 2:
+                    raise ValueError("Extended profile validation requires context and layout coverage")
+                heldout_domains[field] = values
+                for value in values:
+                    trained = fit_rows([row for row in group if row[field] != value], baseline)
+                    residuals.extend(row["measured_cadence_delta_s"] - predict_contrast(row, trained, baseline)
+                                     for row in group if row[field] == value)
         profile = fit_rows(group, baseline)
         profile.update({"model": model, "population": population, "baseline_graph": baseline,
                         "contrasts": len(group), "heldout_repeats": repeats,
                         "contrast_residual_bound_s": max(abs(value) for value in residuals),
                         "contrast_rmse_s": math.sqrt(sum(value * value for value in residuals) / len(residuals)),
                         "uncertainty_scope": "worst_heldout_repeat_layout_contrast_not_statistical_confidence"})
+        if extended_validation:
+            profile.update({"heldout_contexts": heldout_domains["prompt_tokens"],
+                            "heldout_layouts": heldout_domains["rank_zero"],
+                            "uncertainty_scope": "worst_heldout_repeat_context_layout_contrast_not_statistical_confidence"})
         profiles[f"{model}:{population}"] = profile
     return {"status": "diagnostic_profiles_require_full_raw_verification_before_runtime",
             "scope": "per_tenant_population_paired_layout_loss_default_sparse_not_kernel_attention",

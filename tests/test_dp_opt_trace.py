@@ -90,14 +90,22 @@ def test_direct_fastpath_blocked_has_no_admission_or_pause(modules, tmp_path):
 
 @pytest.mark.parametrize("reverse_write_delay", [False, True])
 @pytest.mark.parametrize("policy", ["ilp", "kv_only", "kv_only_rebalance"])
+@pytest.mark.parametrize("provenance_format", ["legacy", "public"])
 def test_centralized_dispatch_preserves_arrivals_and_completes_both_tenants(modules, monkeypatch, tmp_path,
-                                                                        reverse_write_delay, policy):
+                                                                        reverse_write_delay, policy, provenance_format):
     _, runner = modules
     trace = {"duration_s": .05, "requests": [
         {"request_id": "a", "model": 0, "arrival_s": .01, "prompt_tokens": 8, "output_tokens": 2,
          "source_fragment": "sample", "source_internal_row": 1},
         {"request_id": "b", "model": 1, "arrival_s": .02, "prompt_tokens": 8, "output_tokens": 2,
          "source_fragment": "sample", "source_internal_row": 2}]}
+    if provenance_format == "public":
+        for mark in trace["requests"]:
+            mark["source_row"] = mark.pop("source_internal_row")
+            mark.update({"dataset": "public-fixture", "revision": "HTTP-content-snapshot",
+                         "source_file": "snapshot.jsonl", "assistant_index": 1,
+                         "source_sha256": "a" * 64, "original_output_tokens": 2,
+                         "original_response_sha256": "b" * 64})
     trace_path = tmp_path / "trace.json"
     trace_path.write_text(json.dumps(trace))
     observation = {"requests": [], "mapped_bytes": 0, "block_size": 16, "block_bytes": 1024}
@@ -134,11 +142,12 @@ def test_centralized_dispatch_preserves_arrivals_and_completes_both_tenants(modu
     tokenizer = SimpleNamespace(encode=lambda *args, **kwargs: [1, 2])
 
     async def run():
-        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], snapshots=AsyncMock(return_value=records),
+        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], notify_release=AsyncMock(), snapshots=AsyncMock(return_value=records),
                                      try_direct_admission=AsyncMock(side_effect=direct), schedule_admission=AsyncMock(),
                                      rebalance_after_release=AsyncMock(return_value={"path": "release_rebalance_ilp",
                                          "moves": [], "end_to_end_control_s": .01, "preplan_s": 0}))
         result = await runner.run_trace([None, None], controller, args, trace, tokenizer, policy, 0, tmp_path / "trial")
+        assert sorted(call.args[0] for call in controller.notify_release.await_args_list) == [0, 1]
         controller.schedule_admission.assert_not_awaited()
         if policy == "kv_only_rebalance":
             assert controller.rebalance_after_release.await_count >= 1
@@ -153,6 +162,10 @@ def test_centralized_dispatch_preserves_arrivals_and_completes_both_tenants(modu
     for request in json.loads((tmp_path / "trial/requests.json").read_text()):
         mark = next(mark for mark in trace["requests"] if mark["request_id"] == request["request_id"])
         assert request["arrived_at"] == workload["origin"] + mark["arrival_s"]
+        for name, value in runner.request_provenance(mark).items():
+            assert request[name] == value
+        if provenance_format == "public":
+            assert "source_internal_row" not in request
     for name in ("requests", "decisions", "population"):
         journal = [json.loads(line) for line in (tmp_path / f"trial/{name}.jsonl").read_text().splitlines()]
         assert journal == json.loads((tmp_path / f"trial/{name}.json").read_text())
@@ -161,6 +174,22 @@ def test_centralized_dispatch_preserves_arrivals_and_completes_both_tenants(modu
         released = {event["request_id"] for decision in decisions if decision["path"] == "release_rebalance_ilp"
                     for event in decision["release_events"]}
         assert released == {"a", "b"}
+
+
+@pytest.mark.parametrize("field", ["source_row", "source_sha256", "original_response_sha256", "dataset"])
+def test_public_provenance_verifier_rejects_changed_or_missing_fields(modules, field):
+    _, runner = modules
+    verifier = importlib.import_module("verify_trace")
+    mark = {"source_row": 0, "source_sha256": "a" * 64,
+            "original_response_sha256": "b" * 64, "dataset": "public-fixture"}
+    record = runner.request_provenance(mark)
+    verifier.verify_request_provenance(record, mark)
+    changed = {**record, field: "changed"}
+    with pytest.raises(ValueError, match="source provenance"):
+        verifier.verify_request_provenance(changed, mark)
+    record.pop(field)
+    with pytest.raises(ValueError, match="source provenance"):
+        verifier.verify_request_provenance(record, mark)
 
 
 def test_incremental_journal_retains_prior_events(modules, tmp_path):
@@ -204,7 +233,7 @@ def test_release_worker_failure_aborts_trace_and_drains_tasks(modules, monkeypat
                            prepared_prompts={"8": [1] * 8})
 
     async def run():
-        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], snapshots=AsyncMock(return_value=records),
+        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], notify_release=AsyncMock(), snapshots=AsyncMock(return_value=records),
             try_direct_admission=AsyncMock(side_effect=direct),
             rebalance_after_release=AsyncMock(side_effect=RuntimeError("uncertain KV transfer")))
         with pytest.raises(RuntimeError, match="uncertain KV transfer"):
@@ -362,6 +391,50 @@ def test_agentic_bank_rejects_different_episode(modules, tmp_path):
         verifier.verify_prompt_bank(trace, bank)
 
 
+@pytest.fixture
+def public_prompt_bank(tmp_path):
+    entry = {"prompt_tokens": 2, "token_ids": [1, 2], "dataset": "public/dataset",
+             "revision": "fixed-revision", "source_file": "shard.parquet", "source_row": 7,
+             "assistant_index": 1, "source_sha256": "a" * 64, "selection_sha256": "b" * 64,
+             "original_response_sha256": "c" * 64, "original_output_tokens": 16314}
+    bank = tmp_path / "bank.json"
+    bank.write_text(json.dumps({"prompts": {"public": entry, "swe": {
+        "prompt_tokens": 3, "token_ids": [3, 4, 5], "traj_id": "episode"}}}))
+    public = {name: value for name, value in entry.items() if name != "token_ids"}
+    public.update({"prompt_key": "public", "output_tokens": entry["original_output_tokens"]})
+    trace = {"prompt_bank_sha256": hashlib.sha256(bank.read_bytes()).hexdigest(), "requests": [
+        public, {"prompt_key": "swe", "source_traj_id": "episode", "prompt_tokens": 3}]}
+    return bank, trace
+
+
+def test_mixed_public_and_agentic_prompt_bank_accepts_original_sources(modules, public_prompt_bank):
+    verifier = importlib.import_module("verify_trace")
+    bank, trace = public_prompt_bank
+    verifier.verify_prompt_bank(trace, bank)
+
+
+@pytest.mark.parametrize("field", ["dataset", "revision", "source_file", "source_row", "assistant_index",
+                                  "source_sha256", "selection_sha256", "original_response_sha256",
+                                  "original_output_tokens", "output_tokens"])
+def test_public_prompt_bank_rejects_changed_source_or_extended_response(modules, public_prompt_bank, field):
+    verifier = importlib.import_module("verify_trace")
+    bank, trace = public_prompt_bank
+    trace["requests"][0][field] = "changed"
+    with pytest.raises(ValueError, match="Public prompt source or original response length"):
+        verifier.verify_prompt_bank(trace, bank)
+
+
+@pytest.mark.parametrize("field", ["dataset", "revision", "source_file", "source_row", "assistant_index",
+                                  "source_sha256", "selection_sha256", "original_response_sha256",
+                                  "original_output_tokens", "output_tokens"])
+def test_public_prompt_bank_rejects_missing_provenance(modules, public_prompt_bank, field):
+    verifier = importlib.import_module("verify_trace")
+    bank, trace = public_prompt_bank
+    del trace["requests"][0][field]
+    with pytest.raises(ValueError, match="Public prompt source"):
+        verifier.verify_prompt_bank(trace, bank)
+
+
 def test_asymmetric_residency_uses_per_model_rates_and_window_clipping(modules):
     analyzer = importlib.import_module("analyze_trace")
     requests = [{"model": 0, "prompt_tokens": 16, "token_ids": [1, 2],
@@ -430,6 +503,20 @@ def test_trace_backlog_uses_exact_frozen_arrivals_and_completions(modules):
                 {"arrived_at": 5, "submitted_at": 6, "completed_at": 8}]
     assert analyzer.peak_intervals(requests, "completed_at") == 2
     assert analyzer.peak_intervals(requests, "submitted_at") == 1
+
+
+def test_random_greedy_control_is_not_omitted_from_pause_and_copy_breakdown(modules):
+    verifier = importlib.import_module("verify_trace")
+    decisions = [{"path": "direct_fastpath", "end_to_end_control_s": 3},
+                 {"path": "blocked_random_greedy", "end_to_end_control_s": 2, "preplan_s": .1,
+                  "admitted": True, "pause_call_s": .5, "solve_s": 0, "resume_s": .1,
+                  "active_blocking_upper_request_s": 4, "moves": [{"elapsed_s": .7}]}]
+    result = verifier.control_metrics(decisions)
+    assert result["staged_attempts"] == 0 and result["random_greedy_attempts"] == 1
+    assert result["random_greedy_admissions"] == 1 and result["random_greedy_control_s"] == 2
+    assert result["pause_call_s"] == .5 and result["migration_elapsed_s"] == .7
+    assert result["active_blocking_upper_request_s"] == 4
+    assert result["total_control_s_including_preplan"] == pytest.approx(5.1)
 
 
 def test_same_snapshot_action_signature_retains_migration_identity(modules):
@@ -758,7 +845,7 @@ def test_allocator_wait_does_not_block_other_tenant_or_resubmit_same_request(mod
                            request_timeout_s=5, queue_poll_s=.01, deadline_s=20)
 
     async def run():
-        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], snapshots=AsyncMock(return_value=observations),
+        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], notify_release=AsyncMock(), snapshots=AsyncMock(return_value=observations),
                                      check_capacity=AsyncMock(), try_direct_admission=AsyncMock(side_effect=direct),
                                      schedule_admission=AsyncMock(), concurrent_admission=concurrent)
         return await runner.run_trace([None, None], controller, args, trace,
@@ -811,7 +898,7 @@ def test_independent_dispatcher_keeps_conv_fifo_while_code_observation_waits(mod
     args = SimpleNamespace(kv_budget_mib=2112, output=tmp_path, request_timeout_s=5, queue_poll_s=.01, deadline_s=20)
 
     async def run():
-        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], snapshots=AsyncMock(return_value=observations),
+        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], notify_release=AsyncMock(), snapshots=AsyncMock(return_value=observations),
                                      check_capacity=AsyncMock(), try_direct_admission=AsyncMock(side_effect=direct),
                                      schedule_admission=AsyncMock(), concurrent_admission=True)
         return await runner.run_trace([None, None], controller, args, trace,

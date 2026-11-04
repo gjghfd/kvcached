@@ -7,7 +7,7 @@ from pathlib import Path
 from calibrated_cost import SPARSE_CAPTURE_SIZES
 from verify_benefit import verify_ownership, verify_runtime_control
 from verify_trace import capture_entries
-from workaware_cost import fit_cadence, validate_fit
+from workaware_cost import anchored_cadence, fit_cadence, validate_fit
 from workaware_pilot import OUTPUT_TOKENS, SOURCE_FILES, WINDOW, calibration_cases, stable_sample
 from workaware_evidence import verify_runtime
 
@@ -16,9 +16,10 @@ def verify(root, output=None):
     def read(name):
         return json.loads((root / name).read_text())
 
-    cases = calibration_cases()
     verify_runtime(root)
     config, summary = read("config.json"), read("summary.json")
+    plan = config.get("workaware_case_plan")
+    cases = calibration_cases(plan) if plan is not None else calibration_cases()
     if (summary != {"status": "workaware_cadence_pilot_passed", "cases": len(cases),
                     "capture_sizes": SPARSE_CAPTURE_SIZES, "scope": "one_active_tenant_other_resident_idle"}
             or config["max_model_len"] != 131072 or config["cache_bytes"] != 24 * 1024**3
@@ -94,13 +95,34 @@ def verify(root, output=None):
             or any(not any("FULL" in entry["mode"] and entry["steps"] > 0 for entry in capture_entries(capture))
                    for ranks in captures for capture in ranks)):
         raise ValueError("Workaware calibration lacks real sparse graph execution on all four ranks")
-    fit = fit_cadence(samples)
+    source_names = SOURCE_FILES
+    if plan is not None:
+        manifest = read("workaware-runtime-source.json")
+        source_names = tuple(dict.fromkeys((*SOURCE_FILES,
+            *("workaware-runtime-source/" + name for name in manifest["sources"]))))
+    anchor_manifest = root / "workaware-cadence-anchor.json"
+    if anchor_manifest.exists():
+        if plan is None or read(anchor_manifest.name) != {"schema_version": 1, "source": "cadence-anchor"}:
+            raise ValueError("Supplemental cadence anchor must be explicit, relative and versioned")
+        anchor_root = root / "cadence-anchor"
+        if (anchor_root.is_symlink() or (anchor_root / anchor_manifest.name).exists()
+                or (anchor_root / "workaware-profile-sources.json").exists()):
+            raise ValueError("Nested or symbolic cadence anchors are not supported")
+        from verify_workaware_profile import verify_profile
+        from workaware_profile_bundle import source_files
+
+        anchor_fit = verify_profile(anchor_root)
+        fit = anchored_cadence(samples, anchor_fit)
+        source_names = tuple(dict.fromkeys((*source_names, anchor_manifest.name,
+            *("cadence-anchor/" + name for name in source_files(anchor_root, anchor_fit)))))
+    else:
+        fit = fit_cadence(samples)
     fit.update({"status": "raw_verified_workaware_cadence_fit", "source_verification": "raw_verified",
                 "max_population": max(case["population"] for case in cases),
                 "max_context_tokens": max(lengths) + OUTPUT_TOKENS - 1,
                 "max_attention_tokens": max(max(sample["context_tokens"]) for sample in samples),
                 "calibrated_models": [0, 1], "cases": len(cases), "requests": len(identifiers),
-                "source_files_sha256": {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in SOURCE_FILES},
+                "source_files_sha256": {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in source_names},
                 "domain_scope": "measured_context_and_population_envelope_not_all_joint_combinations",
                 "model_samples": {str(model): sum(case["model"] == model for case in cases) for model in (0, 1)}})
     validate_fit(fit)

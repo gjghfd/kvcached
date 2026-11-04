@@ -1,5 +1,111 @@
 # Next-phase gates after job257484
 
+## Update after verified259091 and active260757 (2026-10-28)
+
+Final checkpoint:260757 is COMPLETED/0:0 at19:07:47;493rawfiles and864formal
+requests independently verify. The primary-window workaware-vs-headroom Conv
+P95/P99 regress6.429%/3.096%; unique return benefit is not established. Exact
+compiler reuse is promoted locally only after terminal, with198targeted tests
+and full verifier passing; current GPU results still use the old frozen compiler.
+No new calibration/trace job is submitted. Follow the explicit
+[phase-calibration-plan](workaware-phase-calibration-plan.md), retaining all
+six-policy negative and startup results, rather than blind positive-result tuning.
+
+The14:13 completed-policy subset checkpoint independently verifies132files and
+288formal requests for workaware/random, while fair and the other policies are
+still executing. ConvP99 improves20.806% descriptively, but every interpolation
+endpoint precedes any migration; it is not causal evidence for return or rank
+selection. The four Conv requests active at return instead show3.563% worse
+full-requestTPOT. Keep these as negative/mechanism limits, and wait for complete
+six-policy comparison before promoting the isolated compiler or changing rates.
+
+Control calibration has a concrete new scope issue: random's seven copies take
+.421970s, workaware's three take.189467s, but total measured pause calls are
+.844273s versus6.537361s. Most workaware admission/return boundary waiting is
+in the idle Code tenant, before Conv reaches its own default32 boundary. Calibrate
+incoming/host handshake versus genuinely blocked old decode independently. Any
+future affected-tenant transaction optimization must retain both attention DP
+ranks' EP/default32 execution for a participating model, globally close admission,
+prove unaffected tenants cannot allocate beyond frozen full reservations, preserve
+copy-peak/owner/graph checks, and compare the shared optimization in baselines too;
+do not simply skip an idle attention rank or call a shared data-plane fix an ILP win.
+
+The isolated path-neutral diagnostic also corrects interpretation of an existing
+reporting helper: `control_metrics` excludes random greedy actions from its staged
+breakdown. Overall totals are verified; zero random pause/copy subtotals from that
+helper are not measurements. Patch it only after active source freezing ends.
+
+The pressure follow-up now confirms the admission mechanism: second Code
+queue636.361s under no_move versus30.941..33.508s under migration, measured
+pressure1.1963. It does **not** establish a unique workaware-return win:
+headroom has better Code and Conv tailTTFT, while workaware improves Conv
+request-average TPOT by only.72% in the full arrival window. The same frozen
+trace is now running with random_no_return in260757; do not revise its active
+algorithm, trace, calibration or source manifests.
+
+After complete six-policy archival, separate three contributions before revising
+the general algorithm:
+
+1. **Admission rank selection**: an available target requires seven moves while
+   the other requires one. Random-versus-ILP gains here are admission-choice gains,
+   not evidence that performance-aware return is effective.
+2. **Population-domain coverage**: workaware defers returns at N7/N6/N5 and
+   executes only at N4. Profile these missing populations with all feasible
+   candidate count partitions, mature context coverage, independent repeats and
+   held-out errors; reject A800 cases outside actual capacity. Preserve existing
+   domains until verified new calibration exists, rather than extrapolating.
+3. **Tail protection and real migration cost**: all-control workaware15.149s
+   exceeds headroom13.967s despite fewer moves. Charge transaction activation,
+   staged copies and uncertainty once at their actual scopes; minimizing remaining
+   request-seconds does not by itself protect pending Conv requests' TTFT. Check
+   pending first-token work before an elective return and revalidate at the
+   pause boundary; any tail budget or arrival-risk prior must be declared before
+   the next paired trace, use only current/past arrivals and be reported separately
+   from decode-service improvements. Do not inspect future frozen arrivals.
+
+An independent source-owner reconstruction enumerates511 bounded subsets per
+target in the first blocked arrival and finds no final-memory-feasible subset:
+minimum excess224MiB/32MiB. This is under conservative independent rounding of
+each destination request, not proof that the real allocator cannot reuse mapped
+holes. Investigate destination block/page selection in a dedicated paused,
+rollback-safe GPU probe. If the real allocator can safely use that space, change
+the shared placement certificate and verification for **all migration policies**,
+not only workaware; do not attribute a shared capacity-accounting fix to a new
+   performance algorithm or skip the source-owner/copy-peak checks.
+
+The tail timing audit also requires a **joint-active phase calibration** before
+claiming to optimize these ConvP99 samples. Both headroom/workaware P99 endpoints
+precede their first actual return and overlap Code residence; no Conv TTFT
+interval overlaps either successful return. A later return cannot causally fix
+an earlier first token. Preserve stage-specific Code prefill/decode versus
+Conv-only measurements and include admission-choice/observer overhead plus
+paired run variability; do not change the existing sparse graph or use future
+Code marks in a decision. Tail protection remains useful but is not already
+proven to explain this particular P99 regression.
+
+The primary acceptance checks remain Conv/Code avg/P95/P99 TTFT and Conv avgTPOT,
+with combined metrics, Code TPOT and all-control cost as adverse checks. Retain
+every negative outcome. Two Code marks give descriptive tails only; eventual
+incremental improvements require paired repeat/seed confirmation.
+
+The260757 N9 auxiliary result adds two separate gates. Its compiler spends
+1/9s per scenario and misses incumbents in three unconstrained cases. Exact
+source-owner release and identical-membership graph-selector reuse fixes that
+locally without changing the objective, while preserving separate attention
+segments. The candidate is isolated under `.workaware-stage/solver-reuse`, with
+47 tests and exhaustive raw-snapshot optima; do not promote it over the active
+allocation. Also distinguish `no_verified_incumbent` fallback from a certified
+unprofitable optimum in diagnostics.
+
+After that exact optimization, the old uncertainty gate still rejects the
+best N9 four-move candidate: gain126.390 versus bound448.792 request-seconds.
+Before a subsequent GPU benefit experiment, collect independent calibration
+repeats and inspect population/layout/context-specific held-out errors, including
+the missing5/6/7 populations. A more precise bound must be justified by held-out
+evidence under a predeclared general rule, not reduced until this final trace wins.
+Preserve raw calibration contrasts and conditional-domain failures; an ILP CPU
+speedup or a lower surrogate objective alone does not demonstrate net GPU gain.
+
 The verified result is in `../reports/workaware-return-results.md`. This document
 plans a follow-up; it does not claim a submitted job, deployed new cost model or
 completed benefit goal. Preserve the original trace and every adverse metric.

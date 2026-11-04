@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 
-def extract_raw(bundle, staging, manifest, job):
+def extract_raw(bundle, staging, manifest, job, allow_missing_failed_progress=False):
     pointers = []
     with tarfile.open(bundle) as contents:
         members = contents.getmembers()
@@ -16,6 +16,13 @@ def extract_raw(bundle, staging, manifest, job):
         if len(names) != len(set(names)):
             raise ValueError("Duplicate raw archive member")
         regular = {str(PurePosixPath(member.name)) for member in members if member.isfile()}
+        failed_exit = False
+        if allow_missing_failed_progress:
+            exit_member = next((member for member in members if member.isfile()
+                                and str(PurePosixPath(member.name)) == "exit-status"), None)
+            if exit_member is not None and exit_member.size <= 32:
+                value = contents.extractfile(exit_member).read().strip()
+                failed_exit = value.isdigit() and 0 < int(value) < 256
         extracted = []
         for member in members:
             name = PurePosixPath(member.name)
@@ -28,8 +35,15 @@ def extract_raw(bundle, staging, manifest, job):
                 if not target.is_absolute() or ".." in target.parts or len(matches) != 1:
                     raise ValueError("Unsafe raw progress pointer")
                 relative = PurePosixPath(*target.parts[matches[0] + 4:])
-                if len(relative.parts) != 2 or relative.name != "progress.json" or str(relative) not in regular:
+                if len(relative.parts) != 2 or relative.name != "progress.json":
                     raise ValueError("Raw progress pointer lacks an archived regular target")
+                if str(relative) not in regular:
+                    if not failed_exit:
+                        raise ValueError("Raw progress pointer lacks an archived regular target")
+                    pointers.append({"name": member.name, "remote_target": member.linkname,
+                                     "archived_target": str(relative), "target_present": False,
+                                     "action": "absent_failed_job_target_recorded_not_fabricated"})
+                    continue
                 pointers.append({"name": member.name, "remote_target": member.linkname,
                                  "archived_target": str(relative), "action": "recorded_not_extracted"})
                 continue
@@ -203,7 +217,7 @@ def main():
                                stdout=output, check=True, timeout=1800)
         staging = args.archive / f"download-{args.job}-{attempt_id}"
         staging.mkdir()
-        pointers = extract_raw(bundle, staging, manifest, args.job)
+        pointers = extract_raw(bundle, staging, manifest, args.job, allow_missing_failed_progress=state != "COMPLETED")
         after = subprocess.run(["ssh", *options, "paracloud",
                                 f'cd "{remote}"; find . -type f -print0 | sort -z | xargs -0 sha256sum'],
                                check=True, text=True, capture_output=True, timeout=540).stdout

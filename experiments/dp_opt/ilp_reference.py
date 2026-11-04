@@ -143,9 +143,13 @@ def solve_candidate(snapshot, target=None, max_moves=None, time_limit_s=10):
                 joint_entries.append((count_a, count_b, dimensions))
                 dimensions += 1
     if source_pages is not None:
+        release_groups = {}
         for page in source_pages:
-            release_positions.append(list(range(dimensions, dimensions + stages + 1)))
-            dimensions += stages + 1
+            key = (page["rank"], page.get("pool"), tuple(sorted(page["owners"])), page.get("pinned", False))
+            if key not in release_groups:
+                release_groups[key] = list(range(dimensions, dimensions + stages + 1))
+                dimensions += stages + 1
+            release_positions.append(release_groups[key])
     activation_position = None
     if "migration_activation_cost_s" in snapshot or "migration_budget_s" in snapshot:
         activation_position = dimensions
@@ -217,9 +221,14 @@ def solve_candidate(snapshot, target=None, max_moves=None, time_limit_s=10):
         for request_index in range(len(requests)):
             row[request_index * stages + stage] = 1
         constraint(row, maximum=1)
+    constrained_release_groups = set()
     for page, positions in zip(source_pages or [], release_positions):
         if upper[positions[-1]] == 0:
             continue
+        key = tuple(positions)
+        if key in constrained_release_groups:
+            continue
+        constrained_release_groups.add(key)
         for completed in range(1, stages + 1):
             aggregate = np.zeros(dimensions)
             aggregate[positions[completed]] = 1

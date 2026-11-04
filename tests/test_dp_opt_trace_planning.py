@@ -29,7 +29,7 @@ def observations(epoch):
     return records
 
 
-@pytest.mark.parametrize("policy", ["own_model", "ilp", "kv_only", "kv_only_rebalance", "kv_only_amortized"])
+@pytest.mark.parametrize("policy", ["own_model", "ilp", "kv_only", "random_no_return", "kv_only_rebalance", "kv_only_amortized"])
 @pytest.mark.parametrize("concurrent", [False, True])
 @pytest.mark.parametrize("wait_aware", [False, True])
 def test_planning_rejection_or_cooldown_preserves_direct_fifo(runner, monkeypatch, tmp_path, policy, concurrent,
@@ -76,7 +76,7 @@ def test_planning_rejection_or_cooldown_preserves_direct_fifo(runner, monkeypatc
                            output=tmp_path, prepared_prompts={"16": [1] * 16})
 
     async def run():
-        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], concurrent_admission=concurrent,
+        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], notify_release=AsyncMock(), concurrent_admission=concurrent,
                                      snapshots=AsyncMock(return_value=observations(0)),
                                      try_direct_admission=AsyncMock(side_effect=direct),
                                      schedule_admission=AsyncMock(side_effect=schedule),
@@ -86,6 +86,9 @@ def test_planning_rejection_or_cooldown_preserves_direct_fifo(runner, monkeypatc
         assert controller.schedule_admission.await_count == int(policy != "own_model" and not (policy == "ilp" and wait_aware))
         for call in controller.schedule_admission.await_args_list:
             assert call.kwargs["policy"] == ("kv_only" if policy in ("kv_only_rebalance", "kv_only_amortized") else policy)
+        if policy == "random_no_return":
+            controller.rebalance_after_release.assert_not_awaited()
+            assert result["ilp_attempts"] == 0 and result["random_greedy_attempts"] == 1
         return result
 
     result = asyncio.run(run())
@@ -116,7 +119,7 @@ def test_no_candidate_wait_timeout_preserves_evidence_without_pause_or_submissio
                            prepared_prompts={"16": [1] * 16})
 
     async def run():
-        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], snapshots=AsyncMock(return_value=records),
+        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], notify_release=AsyncMock(), snapshots=AsyncMock(return_value=records),
                                      try_direct_admission=AsyncMock(return_value={"admitted": False,
                                          "observations": records, "end_to_end_control_s": .001}),
                                      schedule_admission=AsyncMock())
@@ -172,7 +175,7 @@ def test_prepared_dispatch_keeps_same_cost_parameters_and_accounts_for_planning(
                            wait_old_transaction_fixed_s=.09, output=tmp_path, prepared_prompts={"16": [1] * 16})
 
     async def run():
-        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], snapshots=AsyncMock(return_value=records),
+        controller = SimpleNamespace(lock=asyncio.Lock(), events=[], notify_release=AsyncMock(), snapshots=AsyncMock(return_value=records),
             try_direct_admission=AsyncMock(return_value={"admitted": False, "observations": records,
                                                          "end_to_end_control_s": .001}),
             prepare_admission=prepare, schedule_admission=schedule)

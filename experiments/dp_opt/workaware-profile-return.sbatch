@@ -74,7 +74,7 @@ phase() {
 }
 for population in "${recovery_populations[@]}"; do
     export DP_OPT_TRACE_PATH="$DP_OPT_WORKAWARE_FIXTURE_ROOT/recovery-$population.json"
-    export DP_OPT_TRACE_POLICIES="kv_only_headroom kv_only_workaware"
+    export DP_OPT_TRACE_POLICIES="${DP_OPT_WORKAWARE_RECOVERY_POLICIES:-kv_only_headroom kv_only_workaware}"
     phase "recovery-$population"
     env -u ENABLE_KVCACHED -u KVCACHED_AUTOPATCH python "$repo/experiments/dp_opt/verify_trace.py" \
         "$evidence/recovery-$population" --prompt-bank "$DP_OPT_PROMPT_BANK" \
@@ -82,6 +82,12 @@ for population in "${recovery_populations[@]}"; do
 done
 export DP_OPT_TRACE_PATH="$DP_OPT_WORKAWARE_TRACE_PATH"
 export DP_OPT_TRACE_POLICIES="no_move no_move_fair kv_only kv_only_headroom kv_only_workaware"
+if [[ -n "${DP_OPT_WORKAWARE_POLICIES:-}" ]]; then
+    export DP_OPT_TRACE_POLICIES="$DP_OPT_WORKAWARE_POLICIES"
+fi
+case " $DP_OPT_TRACE_POLICIES " in
+    *" random_no_return "*) export DP_OPT_RANDOM_BASELINE=1 ;;
+esac
 phase paired-trace
 env -u ENABLE_KVCACHED -u KVCACHED_AUTOPATCH python "$repo/experiments/dp_opt/verify_trace.py" \
     "$evidence/paired-trace" --prompt-bank "$DP_OPT_PROMPT_BANK" --output "$evidence/trace-verification.json"

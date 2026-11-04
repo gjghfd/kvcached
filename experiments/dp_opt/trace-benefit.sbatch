@@ -43,6 +43,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 env -u ENABLE_KVCACHED -u KVCACHED_AUTOPATCH -u DP_OPT_PAUSE_SYNC_INTERVAL -u DP_OPT_KV_TRANSPORT python -m pytest -q \
     "$repo/tests/test_dp_opt_live_placement.py" "$repo/tests/test_dp_opt_live_benefit.py" \
+    "$repo/tests/test_dp_opt_random_placement.py" \
     "$repo/tests/test_dp_opt_trace.py" "$repo/tests/test_dp_opt_ilp_reference.py" \
     "$repo/tests/test_dp_opt_migration_precheck.py" "$repo/tests/test_dp_opt_trace_planning.py" \
     "$repo/tests/test_dp_opt_candidate_revalidation.py" "$repo/tests/test_dp_opt_queue_fairness.py" \
@@ -71,6 +72,7 @@ nvidia-smi topo -m > "$evidence/topology.txt"
 date -Is > "$evidence/started-at"
 sha256sum "$repo/experiments/dp_opt/live_"*.py "$repo/experiments/dp_opt/poisson_trace.py" \
     "$repo/experiments/dp_opt/trace-benefit.sbatch" "$repo/experiments/dp_opt/ilp_reference.py" \
+    "$repo/experiments/dp_opt/random_placement.py" \
     "$repo/experiments/dp_opt/worker.py" "$repo/kvcached/integration/vllm/patches.py" \
     "$root/state/sparse-fit-231467.json" "${DP_OPT_TRACE_PATH:?Set DP_OPT_TRACE_PATH}" > "$evidence/source.sha256"
 if [[ -n "${DP_OPT_PROMPT_BANK:-}" ]]; then
@@ -101,12 +103,16 @@ if [[ "${DP_OPT_WORKAWARE_CADENCE_PILOT:-0}" == 1 || -n "${DP_OPT_WORKAWARE_FIT:
         sha256sum "$repo/experiments/dp_opt/$filename" >> "$evidence/source.sha256"
     done < <(python -c 'from workaware_evidence import runtime_files; print("\n".join(runtime_files()))')
     env -u ENABLE_KVCACHED -u KVCACHED_AUTOPATCH -u DP_OPT_LIVE_PLACEMENT -u DP_OPT_KV_TRANSPORT \
+        -u DP_OPT_WORKAWARE_PHASE_PROFILES -u DP_OPT_RANDOM_BASELINE -u DP_OPT_WORKAWARE_PROFILES \
         python -m pytest -q "$repo/tests/test_dp_opt_workaware_cost.py" \
         "$repo/tests/test_dp_opt_workaware_rebalance.py" "$repo/tests/test_dp_opt_workaware_ilp.py" \
         "$repo/tests/test_dp_opt_workaware_pilot.py" "$repo/tests/test_dp_opt_workaware_live.py"
 fi
 if [[ "${DP_OPT_WORKAWARE_CADENCE_PILOT:-0}" == 1 ]]; then
     extra_args+=(--workaware-cadence-pilot)
+    if [[ -n "${DP_OPT_WORKAWARE_CALIBRATION_PLAN:-}" ]]; then
+        extra_args+=(--workaware-calibration-plan "$DP_OPT_WORKAWARE_CALIBRATION_PLAN")
+    fi
 fi
 if [[ -n "${DP_OPT_WORKAWARE_FIT:-}" ]]; then
     read -r -a workaware_rates <<< "${DP_OPT_WORKAWARE_RATE_PRIORS:?Freeze two external rate priors}"
@@ -252,6 +258,17 @@ extra_args+=(--rebalance-max-moves "${DP_OPT_REBALANCE_MAX_MOVES:-4}"
     --rebalance-cooldown-s "${DP_OPT_REBALANCE_COOLDOWN_S:-10}")
 if [[ -n "${DP_OPT_REBALANCE_PAUSE_FIXED_S:-}" ]]; then
     extra_args+=(--rebalance-pause-fixed-s "$DP_OPT_REBALANCE_PAUSE_FIXED_S")
+fi
+if [[ "${DP_OPT_WORKAWARE_OPTIMIZER:-point}" == robust ]]; then
+    extra_args+=(--workaware-optimizer robust)
+    sha256sum "$repo/experiments/dp_opt/workaware_robust_adapter.py" \
+        "$repo/experiments/dp_opt/workaware_robust_rebalance.py" \
+        "$repo/experiments/dp_opt/workaware_robust_ilp.py" \
+        "$repo/experiments/dp_opt/verify_workaware_robust_rebalance.py" \
+        "$repo/experiments/dp_opt/verify_rebalance.py" "$repo/experiments/dp_opt/verify_trace.py" >> "$evidence/source.sha256"
+elif [[ "${DP_OPT_WORKAWARE_OPTIMIZER:-point}" != point ]]; then
+    echo 'Unknown workaware optimizer' >&2
+    exit 2
 fi
 python "$repo/experiments/dp_opt/live_trace.py" --checkpoint "$checkpoint" \
     --fit "$root/state/sparse-fit-231467.json" --trace "$DP_OPT_TRACE_PATH" --output "$evidence" \

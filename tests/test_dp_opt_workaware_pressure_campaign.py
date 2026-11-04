@@ -59,3 +59,16 @@ def test_retarget_keeps_Code_and_Conv_mark_prefix_without_selected_arrivals(modu
     (tmp_path / "prompt-bank.json").write_text('{"changed":true}')
     with pytest.raises(ValueError, match="cannot be rebuilt"):
         module.retarget_trace(old, tmp_path, new_rate)
+
+
+def test_Code_waits_include_random_and_measure_full_reservation(module, tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"policies": ["random_no_return"]}))
+    (tmp_path / "trace.json").write_text(json.dumps({"requests": [
+        {"request_id": "code", "arrival_s": 10}]}))
+    directory = tmp_path / "r0-random_no_return"
+    directory.mkdir()
+    (directory / "requests.json").write_text(json.dumps([{"request_id": "code", "model": 0,
+        "arrived_at": 100., "submitted_at": 102., "reserved_at": 103., "first_token_at": 110.}]))
+    result = module.arrival_waits(tmp_path)["random_no_return"][0]
+    assert result["queue_s"] == 3 and result["submission_wait_s"] == 2
+    assert result["reservation_to_first_token_s"] == 7 and result["ttft_s"] == 10

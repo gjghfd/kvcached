@@ -12,10 +12,61 @@ current admission/return ILP, verified results for both tenants and combined
 metrics, limitations, and the running experiment. Individual reports below
 retain their original settings and negative results.
 
-Current follow-up: [Conv pressure target 1.2](docs/workaware-pressure-1p2-protocol.md)
+The [FP32 logits-head correctness control](docs/fp32-head-diagnostic.md) follows
+the reproduced zero-copy co-rank divergence. It explicitly changes head output
+precision, not BF16 weights or sparse graphs; complete same-setting references
+must pass before migration and public-trace benefit experiments can continue.
+
+Current continuation replaces manually lengthened AzureConv outputs with
+[original public response lengths](docs/public-response-workload.md).
+The [C0 verifier failure and explicit C1 recovery](reports/public-quality-source-recovery-results.md)
+preserves the failed job and independently verifies its zero-migration native result.
+The independent [original-response quality cohort study](docs/public-quality-return-study.md)
+keeps the active Stratos bank unchanged and profiles structurally closed
+OpenThoughts3 responses without artificial output extension; GPU benefit and
+best-setting claims still require measured calibration and fixed held-out.
+Its [source/bank profile](reports/public-quality-response-profile.md) records
+original response lengths, fixed native draws, independent checks and limitations.
+[Source screening](reports/public-response-profile.md) compares WildChat,
+LongWriter and OpenThoughts3; the first long-resident candidate is public
+reasoning, not mislabeled human conversation. The bounded hash bank reconstructs
+all original inputs/outputs independently. New service/cost/rate calibration
+precedes the finite seven-policy search and held-out validation. Old synthetic
+Poisson producers are paused; no best-setting benefit is established yet.
+
+Completed follow-up: [Conv pressure target 1.2](docs/workaware-pressure-1p2-protocol.md)
 raises only Conv to `.030863253171591748RPS` from measured physical KV pressure;
 Code stays `.0005RPS` with unchanged arrival marks. See the protocol for the
 fixed five-policy trace and measured-pressure/queue verification requirements.
+[Verified results](reports/workaware-pressure-1p2-results.md) report measured1.1963
+pressure, large Code admission gains and adverse Conv tails, not unique return gains.
+
+Completed job260757 adds [random no-return migration](docs/random-baseline-protocol.md)
+against `kv_only_workaware`, without changing the paired trace or weakening safety.
+[Implementation and continuation status](reports/random-baseline-results.md)
+records all493rawfiles and864formal requests independently verified. Capacity
+gains beat ordinary queueing, but random obtains them too; workaware's unique
+return benefit remains unproven. All tenant and combined tails, adverse startup
+results and [next calibration gates](docs/workaware-phase-calibration-plan.md) are recorded.
+
+The completed continuation preserves shared completion-cache invalidation and
+reuses the252 SHA-verified N5/N6/N7 GPU calibration cases after262969's fit failure.
+UniqueA800 job265356 rebuilt/verified the anchored composite, then ran the old4800s
+paired control and the new9600s six-policy trace with Code`.00025RPS`. It keeps
+paused migration, default32 andGPU`dp_echo`; active sources remain frozen.
+Evidence is `evidence/workaware-anchored-replay-20261029/`; its complete archive and
+paired requests are independently verified, but no timely return gain is established.
+
+The [long-Conv low-population return candidate](docs/long-conv-low-population-return-plan.md)
+is an offline contingency that preserves roughly1.2 KV pressure; it is not the
+active configuration or an already measured improvement.
+The user-selected [first long-output AzureConv probe](docs/long-conv-return-probe.md)
+uses24576 synthetic output and two resident requests, after the current allocation
+is fully verified. It tests return timing/cost before a calibrated Poisson follow-up.
+Unique twoA800 job268245 is pending; [its status/results](reports/long-conv-return-probe-results.md)
+distinguish the new experiment from the verified negative8192-output runs.
+[Early-return status and independent event-aligned diagnostics](reports/workaware-early-return-results.md)
+track baseline natural recovery without attributing pre-return TTFT tails to return.
 
 | Question | Document |
 | --- | --- |

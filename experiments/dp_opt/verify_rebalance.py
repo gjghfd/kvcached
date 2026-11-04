@@ -10,6 +10,11 @@ def verify_rebalance(decision, budgets, fit, lookup=None, config=None, requests=
         raise ValueError("Release rebalance must not create or admit a request")
     settings = decision["settings"]
     workaware = settings.get("policy_mode") == "workaware"
+    optimizer = settings.get("workaware_optimizer", "point")
+    if optimizer not in ("point", "robust") or (optimizer == "robust" and not workaware):
+        raise ValueError("Invalid release optimizer or non-workaware robust plan")
+    if optimizer == "robust" and decision.get("workaware_optimizer") != "robust":
+        raise ValueError("Robust release report lacks its optimizer marker")
     headroom = settings.get("policy_mode") == "headroom"
     amortized = settings.get("policy_mode") in ("amortized", "headroom", "workaware")
     if config is not None:
@@ -33,6 +38,11 @@ def verify_rebalance(decision, budgets, fit, lookup=None, config=None, requests=
                 expected.update({"policy_mode": "workaware", "headroom_profile": evidence["headroom_profile"],
                     "workaware_profile": evidence["workaware_profile"], "workaware_fit": config["workaware_fit_data"],
                     "work_interval_steps": 128})
+                configured_optimizer = config.get("workaware_optimizer", "point")
+                if configured_optimizer not in ("point", "robust") or optimizer != configured_optimizer:
+                    raise ValueError("Release optimizer differs from frozen configuration")
+                if configured_optimizer == "robust":
+                    expected["workaware_optimizer"] = "robust"
         if settings != expected:
             raise ValueError("Release rebalance differs from frozen limits and costs")
     if requests is not None:
@@ -99,6 +109,15 @@ def verify_rebalance(decision, budgets, fit, lookup=None, config=None, requests=
                 decision["blocking_sampled_at"] - receipt["reached_at"])
                 for model, ranks in enumerate(decision["pause_receipts"]) for rank, receipt in enumerate(ranks))
         if workaware:
+            if optimizer == "robust":
+                from workaware_robust_adapter import verify_controller_plan
+
+                configured = {name: value for name, value in settings.items() if name != "workaware_optimizer"}
+                planning_s = decision["preplan_s"] if phase == "before_pause" else decision["solve_s"]
+                verify_controller_plan(check, observed, budgets, fit, configured, phase, pre_solve_blocking, planning_s)
+                continue
+            if "controller_adapter" in check:
+                raise ValueError("Point release plan contains a robust controller adapter")
             from verify_workaware_rebalance import verify_plan
 
             blocking = pre_solve_blocking + (population * decision["solve_s"] if phase == "after_pause" else 0)

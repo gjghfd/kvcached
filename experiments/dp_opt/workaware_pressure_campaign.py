@@ -49,12 +49,14 @@ def arrival_waits(phase):
     trace = json.loads((phase / "trace.json").read_text())
     marks = {mark["request_id"]: mark for mark in trace["requests"]}
     result = {}
-    for policy in ("no_move", "no_move_fair", "kv_only", "kv_only_headroom", "kv_only_workaware"):
+    config = json.loads((phase / "config.json").read_text())
+    for policy in config["policies"]:
         records = json.loads((phase / f"r0-{policy}/requests.json").read_text())
         result[policy] = [{"request_id": record["request_id"],
             "arrival_s": marks[record["request_id"]]["arrival_s"],
-            "queue_s": record["submitted_at"] - record["arrived_at"],
-            "reservation_to_first_token_s": record["first_token_at"] - record["submitted_at"],
+            "queue_s": record["reserved_at"] - record["arrived_at"],
+            "submission_wait_s": record["submitted_at"] - record["arrived_at"],
+            "reservation_to_first_token_s": record["first_token_at"] - record["reserved_at"],
             "ttft_s": record["first_token_at"] - record["arrived_at"]}
             for record in records if record["model"] == 0]
     return result

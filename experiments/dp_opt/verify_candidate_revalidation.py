@@ -103,7 +103,14 @@ def verify_revalidation(decision, fit, lookup):
                 verify_projection(snapshot, candidate, projected)
         feasible = [candidate for candidate in check["plan"]["candidates"] if "objective_s" in candidate]
         direct = [candidate for candidate in feasible if not candidate["moves"]]
-        if policy == "kv_only" and direct:
+        if policy == "random_no_return":
+            from random_placement import select_random_candidate
+
+            chosen = evidence["plan"]["random_selection"]["selected_target"]
+            winner, selection = select_random_candidate(feasible, evidence["placement_seed"], chosen)
+            if check["plan"].get("random_selection") != selection:
+                raise ValueError("Random baseline revalidation differs from its frozen selected target")
+        elif policy == "kv_only" and direct:
             winner = min(direct, key=lambda candidate: (snapshot["counts"][0][candidate["target"]],
                                                        snapshot["initial_gib"][candidate["target"]], candidate["target"]))
         else:

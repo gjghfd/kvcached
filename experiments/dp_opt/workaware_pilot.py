@@ -25,7 +25,11 @@ SOURCE_FILES = (
 )
 
 
-def calibration_cases():
+def calibration_cases(plan=None):
+    if plan is not None:
+        from workaware_calibration_plan import planned_cases
+
+        return planned_cases(plan)
     cases = []
     for model in (0, 1):
         for repeat in (0, 1):
@@ -79,7 +83,8 @@ def stable_sample(requests):
 
 
 async def run_workaware_pilot(engines, controller, args, tokenizer):
-    cases = calibration_cases()
+    plan = getattr(args, "workaware_case_plan", None)
+    cases = calibration_cases(plan)
     prompts = {str(length): prompt_ids(tokenizer, length) for length in sorted({case["prompt_tokens"] for case in cases})}
     save(args.output / "workaware-cases.json", cases)
     save(args.output / "workaware-prompts.json", prompts)
@@ -102,6 +107,16 @@ async def run_workaware_pilot(engines, controller, args, tokenizer):
     for index, case in enumerate(cases):
         await wait_empty(controller)
         await controller.release_transfer_cache()
+        if plan is not None:
+            observations = await controller.snapshots()
+            for rank in (0, 1):
+                geometry = observations[case["model"]][rank]
+                blocks = math.ceil((case["prompt_tokens"] + OUTPUT_TOKENS) / geometry["block_size"])
+                pages = math.ceil(blocks / geometry["page_block_capacity"])
+                count = case["rank_zero"] if rank == 0 else case["population"] - case["rank_zero"]
+                used = sum(ranks[rank]["mapped_bytes"] for ranks in observations)
+                if used + count * pages * geometry["page_bytes"] > args.kv_budget_mib * 1024**2:
+                    raise MemoryError("Calibration all-rank reservation exceeds actual pinned-pool budget")
         tasks = []
         model = case["model"]
         prompt = prompts[str(case["prompt_tokens"])]

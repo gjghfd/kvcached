@@ -35,6 +35,15 @@ def checked_ssh(command, timeout=240):
     return result.stdout.strip()
 
 
+def checked_ssh_script(script, timeout=240):
+    result = subprocess.run(["ssh", "-o", "ConnectTimeout=30", "-o", "ServerAliveInterval=20",
+                             "-o", "ServerAliveCountMax=3", "paracloud", "bash -s"],
+                            input=script, text=True, capture_output=True, timeout=timeout)
+    if result.returncode:
+        raise RuntimeError(f"SSH script failed ({result.returncode}): {result.stderr}")
+    return result.stdout.strip()
+
+
 def process_command(pid):
     result = subprocess.run(["ps", "-p", str(pid), "-o", "state=", "-o", "command="], text=True, capture_output=True)
     if result.returncode or not result.stdout.strip() or result.stdout.lstrip().startswith("Z"):
@@ -99,7 +108,7 @@ def verify_old_failure(archive, job, terminal, diagnosis_path):
     return diagnosis
 
 
-def protected_sync(repo, root, state, files=None, prefix="rebalance"):
+def protected_sync(repo, root, state, files=None, prefix="rebalance", upload_files=()):
     files = SYNC_FILES if files is None else files
     for filename, expected in state.get("frozen_runtime_sha256", {}).items():
         if hashlib.sha256((repo / filename).read_bytes()).hexdigest() != expected:
@@ -128,6 +137,11 @@ def protected_sync(repo, root, state, files=None, prefix="rebalance"):
         for filename in files:
             contents.add(repo / filename, arcname=filename)
         contents.add(root / "frozen/trace.json", arcname="frozen/trace.json")
+        for filename in upload_files:
+            relative = Path(filename)
+            if relative.is_absolute() or ".." in relative.parts or filename == "frozen/trace.json":
+                raise ValueError("Additional frozen upload must remain inside the campaign directory")
+            contents.add(root / relative, arcname=filename)
     checked_ssh(f"mkdir -p {shlex.quote(stage + '/upload')}")
     subprocess.run(["scp", "-o", "ConnectTimeout=30", str(bundle), f"paracloud:{stage}/bundle.tar.gz"], check=True, timeout=240)
     checked_ssh(f"tar -xzf {shlex.quote(stage + '/bundle.tar.gz')} -C {shlex.quote(stage + '/upload')}")
@@ -146,7 +160,7 @@ def protected_sync(repo, root, state, files=None, prefix="rebalance"):
             script.append(f"cp -p {target} {shlex.quote(backup)}")
         script.extend([f"cp {shlex.quote(stage + '/upload/' + item['local'])} {temporary}", f"mv {temporary} {target}"])
     script.extend([safety, "sha256sum " + " ".join(shlex.quote(target) for target in targets.values())])
-    installed = checked_ssh("\n".join(script))
+    installed = checked_ssh_script("\n".join(script))
     if installed.splitlines() != [f'{item["sha256"]}  {item["target"]}' for item in manifest]:
         raise RuntimeError("Installed protected source SHA mismatch")
     (root / "protected-sync-result.txt").write_text(installed + "\nBACKUP " + stage + "/old\n")

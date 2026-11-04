@@ -22,10 +22,7 @@ def validate_fit(fit):
         raise ValueError("Invalid measured peak-attention domain")
 
 
-def fit_cadence(samples, capture_sizes=SPARSE_CAPTURE_SIZES):
-    import numpy as np
-    from scipy.optimize import nnls
-
+def cadence_features(samples, capture_sizes=SPARSE_CAPTURE_SIZES):
     if len(samples) < 6 or capture_sizes != SPARSE_CAPTURE_SIZES:
         raise ValueError("Require varied measured cases and default sparse graphs")
     features, cadences = [], []
@@ -41,6 +38,14 @@ def fit_cadence(samples, capture_sizes=SPARSE_CAPTURE_SIZES):
             raise ValueError("Calibration population exceeds captured graphs")
         features.append([1, padded, max(contexts)])
         cadences.append(sample["cadence_s"])
+    return features, cadences
+
+
+def fit_cadence(samples, capture_sizes=SPARSE_CAPTURE_SIZES):
+    import numpy as np
+    from scipy.optimize import nnls
+
+    features, cadences = cadence_features(samples, capture_sizes)
     design = np.array(features, dtype=float)
     scale = np.maximum(design.max(axis=0), 1)
     if np.linalg.matrix_rank(design / scale) < 3:
@@ -53,6 +58,24 @@ def fit_cadence(samples, capture_sizes=SPARSE_CAPTURE_SIZES):
             "rmse_s": float(np.sqrt(np.mean(residuals**2))), "samples": len(samples),
             "status": "unverified_fit_requires_raw_calibration_verification",
             "capture_sizes": list(capture_sizes), "scope": "one_active_tenant_other_resident_idle"}
+
+
+def anchored_cadence(samples, anchor):
+    validate_fit(anchor)
+    if (anchor.get("status") != "raw_verified_workaware_cadence_fit"
+            or anchor.get("source_verification") != "raw_verified"
+            or anchor.get("scope") != "one_active_tenant_other_resident_idle"):
+        raise ValueError("Cadence anchoring requires independently raw-verified legacy coefficients")
+    features, measured = cadence_features(samples)
+    coefficients = [anchor["coefficients"][name] for name in ("base_s", "graph_batch_s", "attention_token_s")]
+    residuals = [observed - sum(feature * coefficient for feature, coefficient in zip(row, coefficients))
+                 for row, observed in zip(features, measured)]
+    return {"coefficients": dict(anchor["coefficients"]),
+            "residual_bound_s": max(anchor["residual_bound_s"], max(abs(value) for value in residuals)),
+            "rmse_s": math.sqrt(sum(value * value for value in residuals) / len(residuals)), "samples": len(samples),
+            "status": "unverified_fit_requires_raw_calibration_verification",
+            "capture_sizes": list(SPARSE_CAPTURE_SIZES), "scope": "one_active_tenant_other_resident_idle",
+            "coefficient_scope": "fixed_independently_verified_legacy_no_rank_deficient_supplement_refit"}
 
 
 def remaining_segments(observed, fit, max_interval_steps=128):

@@ -55,11 +55,17 @@ def validate_work_snapshot(snapshot):
 
 def allocate_work_variables(snapshot, dimensions):
     variables = []
+    count_groups = {}
     for segment in snapshot.get("work_segments", []):
-        counts = list(range(dimensions, dimensions + segment["population"] + 1))
-        difference = counts[-1] + 1
+        key = (segment["model"], segment["population"], tuple(segment["initial_counts"]),
+               tuple(sorted(segment["request_sources"].items())))
+        if key not in count_groups:
+            count_groups[key] = list(range(dimensions, dimensions + segment["population"] + 1))
+            dimensions += segment["population"] + 1
+        counts = count_groups[key]
+        difference = dimensions
         variables.append({"counts": counts, "difference": difference})
-        dimensions = difference + 1
+        dimensions += 1
     return variables, dimensions
 
 
@@ -67,22 +73,26 @@ def install_work_constraints(snapshot, variables, requests, stages, dimensions,
                              objective, upper, integrality, constraint):
     import numpy as np
 
+    constrained_count_groups = set()
     for segment, positions in zip(snapshot.get("work_segments", []), variables):
         counts, difference = positions["counts"], positions["difference"]
         integrality[counts] = 1
-        objective[counts] = segment["graph_costs_s"]
+        objective[counts] += segment["graph_costs_s"]
         objective[difference] = segment["attention_difference_cost_s"]
         upper[difference] = segment.get("attention_difference_limit_tokens", sum(segment["attention_weights"].values()))
-        row = np.zeros(dimensions)
-        row[counts] = 1
-        constraint(row, minimum=1, maximum=1)
-        row = np.zeros(dimensions)
-        row[counts] = range(len(counts))
-        for index, request in enumerate(requests):
-            if request["id"] in segment["request_sources"]:
-                source = segment["request_sources"][request["id"]]
-                row[index * stages:(index + 1) * stages] = 1 if source == 0 else -1
-        constraint(row, minimum=segment["initial_counts"][0], maximum=segment["initial_counts"][0])
+        key = tuple(counts)
+        if key not in constrained_count_groups:
+            constrained_count_groups.add(key)
+            row = np.zeros(dimensions)
+            row[counts] = 1
+            constraint(row, minimum=1, maximum=1)
+            row = np.zeros(dimensions)
+            row[counts] = range(len(counts))
+            for index, request in enumerate(requests):
+                if request["id"] in segment["request_sources"]:
+                    source = segment["request_sources"][request["id"]]
+                    row[index * stages:(index + 1) * stages] = 1 if source == 0 else -1
+            constraint(row, minimum=segment["initial_counts"][0], maximum=segment["initial_counts"][0])
         initial_difference = sum((1 if source == 0 else -1) * segment["attention_weights"][identifier]
                                  for identifier, source in segment["request_sources"].items())
         for sign in (-1, 1):

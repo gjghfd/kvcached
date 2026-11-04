@@ -12,6 +12,10 @@ from workaware_profile_cost import fit_profiles
 
 def verify_profile(root):
     root = Path(root)
+    if (root / "workaware-profile-sources.json").exists():
+        from workaware_profile_bundle import verify_composite
+
+        return verify_composite(root, verify_profile)
     fit = verify(root)
     trials = json.loads((root / "workaware-trials.json").read_text())
     rebuilt = [{"case": trial["case"], "sample": stable_sample(trial["requests"])} for trial in trials]
@@ -20,8 +24,10 @@ def verify_profile(root):
     contrasts = paired_contrasts(rebuilt, fit)
     if contrasts["unmatched_groups"]:
         raise ValueError("Population profiles require every balanced paired calibration group")
-    profiles = fit_profiles(contrasts["contrasts"])
-    expected = {"{}:{}".format(case["model"], case["population"]) for case in calibration_cases()}
+    plan = json.loads((root / "config.json").read_text()).get("workaware_case_plan")
+    profiles = fit_profiles(contrasts["contrasts"], extended_validation=True) if plan is not None else fit_profiles(contrasts["contrasts"])
+    cases = calibration_cases(plan) if plan is not None else calibration_cases()
+    expected = {"{}:{}".format(case["model"], case["population"]) for case in cases}
     if set(profiles["profiles"]) != expected:
         raise ValueError("Population profiles omit calibrated tenants or populations")
     for profile in profiles["profiles"].values():
@@ -57,7 +63,12 @@ def load_verified_profile(path, expected_sha256, source_root):
     fit = json.loads(payload)
     if fit.get("population_profiles", {}).get("status") != "raw_verified_workaware_population_profiles":
         raise ValueError("Diagnostic population profiles are not usable by serving")
-    for name in SOURCE_FILES:
+    names = fit["source_files_sha256"] if "composite_profile" in fit else SOURCE_FILES
+    for name in names:
+        if "composite_profile" in fit:
+            from workaware_profile_bundle import relative_path
+
+            relative_path(name)
         if hashlib.sha256((Path(source_root) / name).read_bytes()).hexdigest() != fit["source_files_sha256"].get(name):
             raise ValueError("Population profile raw calibration source changed")
     if not same_payload(fit, verify_profile(source_root)):

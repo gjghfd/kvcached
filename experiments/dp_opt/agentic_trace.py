@@ -8,8 +8,9 @@ from pathlib import Path
 
 
 def generate_mixed_trace(code_marks, conv_marks, code_rate, conv_rate, duration, seed,
-                         max_model_len=131072):
-    if (not code_marks or not conv_marks or not math.isfinite(duration) or duration <= 0
+                         max_model_len=131072, allow_empty_tenants=False):
+    if (type(allow_empty_tenants) is not bool
+            or not code_marks or not conv_marks or not math.isfinite(duration) or duration <= 0
             or any(not math.isfinite(rate) or rate <= 0 for rate in (code_rate, conv_rate))):
         raise ValueError("Mixed trace requires two nonempty populations and finite positive rates")
     requests = []
@@ -33,13 +34,16 @@ def generate_mixed_trace(code_marks, conv_marks, code_rate, conv_rate, duration,
                              "model": model, "arrival_s": arrival})
             index += 1
     requests.sort(key=lambda mark: (mark["arrival_s"], mark["model"]))
-    if not requests or {mark["model"] for mark in requests} != {0, 1}:
+    if not allow_empty_tenants and (not requests or {mark["model"] for mark in requests} != {0, 1}):
         raise ValueError("Mixed trace must contain arrivals for both tenants")
-    return {"schema_version": 2, "seed": seed, "total_rate_rps": code_rate + conv_rate,
+    result = {"schema_version": 2, "seed": seed, "total_rate_rps": code_rate + conv_rate,
             "model_rates_rps": [code_rate, conv_rate], "duration_s": duration,
             "max_model_len": max_model_len, "arrival": "two_independent_Poisson_streams",
             "sampling": "SWE_smith_real_history_prefix_and_full_Azure_paired_lengths_declared_slice",
             "model_names": ["SWE-smith-Code", "Azure-Conversation"], "requests": requests}
+    if allow_empty_tenants:
+        result["allow_empty_tenants"] = True
+    return result
 
 
 def build_bank(inputs, tokenizer_path, tokenizer_config_path, code_output_tokens):
@@ -84,6 +88,7 @@ def main():
     parser.add_argument("--conv-rate", type=float, default=1.8)
     parser.add_argument("--duration", type=float, default=1200)
     parser.add_argument("--seed", type=int, default=20261021)
+    parser.add_argument("--allow-empty-tenants", action="store_true")
     parser.add_argument("--code-output-tokens", type=int, default=64)
     parser.add_argument("--max-model-len", type=int, default=131072)
     args = parser.parse_args()
@@ -95,7 +100,7 @@ def main():
             for index, entry in enumerate(json.loads(args.conv_joint.read_text()))
             if entry["prompt_tokens"] >= 2048 and 512 <= entry["output_tokens"] <= 1024]
     trace = generate_mixed_trace(code, conv, args.code_rate, args.conv_rate, args.duration,
-                                 args.seed, args.max_model_len)
+                                 args.seed, args.max_model_len, allow_empty_tenants=args.allow_empty_tenants)
     args.output.mkdir(parents=True)
     bank_path = args.output / "prompt-bank.json"
     bank_path.write_text(json.dumps(bank) + "\n")

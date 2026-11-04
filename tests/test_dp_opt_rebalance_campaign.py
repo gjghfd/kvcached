@@ -101,6 +101,55 @@ def test_checked_ssh_does_not_accept_failed_query(campaign, monkeypatch):
         campaign.checked_ssh("read-only query")
 
 
+def test_large_sync_script_is_streamed_not_passed_as_a_remote_argument(campaign, monkeypatch):
+    script = "set -eu\n" + "printf 'source check\\n'\n" * 100000
+    execute = Mock(return_value=SimpleNamespace(returncode=0, stdout="installed SHA\n", stderr=""))
+    monkeypatch.setattr(campaign.subprocess, "run", execute)
+    assert campaign.checked_ssh_script(script, timeout=600) == "installed SHA"
+    arguments, options = execute.call_args
+    assert arguments[0][-2:] == ["paracloud", "bash -s"]
+    assert script not in arguments[0] and options["input"] == script
+    assert options["text"] and options["capture_output"] and options["timeout"] == 600
+
+
+def test_streamed_install_failure_cannot_be_reported_as_success(campaign, monkeypatch):
+    monkeypatch.setattr(campaign.subprocess, "run", Mock(return_value=SimpleNamespace(
+        returncode=255, stdout="partial output", stderr="connection lost")))
+    with pytest.raises(RuntimeError, match="SSH script failed.*255"):
+        campaign.checked_ssh_script("set -eu\nexit 1\n")
+
+
+def test_protected_sync_retains_guards_backups_and_sha_checks_on_streamed_install(campaign, monkeypatch, tmp_path):
+    repo, root = tmp_path / "repo", tmp_path / "archive"
+    repo.mkdir()
+    (root / "frozen").mkdir(parents=True)
+    (root / "frozen/trace.json").write_text("{}\n")
+    (repo / "runtime.py").write_text("value = 1\n")
+    digest = hashlib.sha256((repo / "runtime.py").read_bytes()).hexdigest()
+    target = "/remote/home/kvcached/kvcached/runtime.py"
+
+    def query(command, timeout=240):
+        if command == 'printf "%s" "$HOME"':
+            return "/remote/home"
+        if command.startswith("if test -f "):
+            return "ABSENT " + target
+        return ""
+
+    install = Mock(return_value=digest + "  " + target)
+    monkeypatch.setattr(campaign, "checked_ssh", query)
+    monkeypatch.setattr(campaign, "checked_ssh_script", install)
+    monkeypatch.setattr(campaign.subprocess, "run", Mock(return_value=SimpleNamespace(returncode=0)))
+    stage, home = campaign.protected_sync(repo, root,
+        {"frozen_runtime_sha256": {"runtime.py": digest}, "protected_vllm_sha256": "a" * 64}, files=("runtime.py",))
+    script = install.call_args.args[0]
+    assert home == "/remote/home" and "/sync/rebalance-" in stage
+    assert 'test -z "$(squeue -h -u "$USER")"' in script
+    assert "test ! -e " + target in script and digest in script
+    assert "sha256sum" in script and ".rebalance-sync" in script and "mv " in script
+    assert "gjghfd/kvcached.git" in script
+    assert (root / "protected-sync-result.txt").read_text().startswith(digest)
+
+
 def test_failed_old_job_cannot_advance_without_explicit_diagnosis(campaign, tmp_path):
     with pytest.raises(RuntimeError, match="explicit raw-verified diagnosis"):
         campaign.verify_old_failure(tmp_path, 123, "FAILED", None)

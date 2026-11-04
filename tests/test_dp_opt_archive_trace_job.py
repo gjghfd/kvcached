@@ -67,6 +67,33 @@ def test_archive_still_requires_exact_manifest(archiver, tmp_path):
         archiver.extract_raw(bundle, tmp_path / "raw", "0" * 64 + manifest[64:], 123)
 
 
+@pytest.mark.parametrize("exit_status,allow,passes", [(b"2\n", True, True), (b"0\n", True, False),
+    (b"2\n", False, False), (b"invalid\n", True, False), (b"256\n", True, False)])
+def test_early_failure_dangling_progress_requires_failed_context_and_nonzero_raw_exit(
+        archiver, tmp_path, exit_status, allow, passes):
+    bundle = tmp_path / "failed.tar.gz"
+    with tarfile.open(bundle, "w:gz") as contents:
+        marker = tarfile.TarInfo("./exit-status")
+        marker.size = len(exit_status)
+        contents.addfile(marker, io.BytesIO(exit_status))
+        pointer = tarfile.TarInfo("./progress.json")
+        pointer.type = tarfile.SYMTYPE
+        pointer.linkname = "/data/run/kvcached-paracloud/state/live-trace-123/calibration/progress.json"
+        contents.addfile(pointer)
+    manifest = hashlib.sha256(exit_status).hexdigest() + "  ./exit-status\n"
+    raw = tmp_path / "raw"
+    if not passes:
+        with pytest.raises(ValueError, match="regular target"):
+            archiver.extract_raw(bundle, raw, manifest, 123, allow_missing_failed_progress=allow)
+        return
+    pointers = archiver.extract_raw(bundle, raw, manifest, 123, allow_missing_failed_progress=allow)
+    assert pointers[0]["target_present"] is False
+    assert pointers[0]["action"] == "absent_failed_job_target_recorded_not_fabricated"
+    assert not (raw / "calibration/progress.json").exists()
+    assert not (raw / "progress.json").is_symlink()
+    archiver.verify_raw(raw, manifest)
+
+
 @pytest.fixture
 def remote_environment(tmp_path):
     root = tmp_path / "home/run/kvcached-paracloud/state/live-trace-123"
