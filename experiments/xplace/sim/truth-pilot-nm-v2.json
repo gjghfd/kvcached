@@ -1,0 +1,56 @@
+{
+ "source": "live fit from /Users/mi/Desktop/MyProjects/ParaCloud/evidence/xplace-j1b-calib-20261103/job-282105/out/trace/no_move window [300, 1500.0)",
+ "tenants": {
+  "0": {
+   "base_s": 0.010315,
+   "graph_s": {
+    "1": 0.0,
+    "8": 0.004624,
+    "16": 0.00609,
+    "32": 0.009256000000000002
+   },
+   "graph_slope_s": 0.00019787500000000013,
+   "attention_s_per_token": 6.109e-08
+  },
+  "1": {
+   "base_s": 0.01078277954148216,
+   "graph_s": {
+    "1": 0.0,
+    "8": 0.006465725603176441,
+    "16": 0.009724889437833676
+   },
+   "graph_slope_s": 0.0002036977396660771,
+   "attention_s_per_token": 5.797331841238892e-08
+  }
+ },
+ "interference": {
+  "1": {
+   "prefill": 0.22500748978299628,
+   "decode": 0.2687611791305198
+  },
+  "0": {
+   "prefill": 0.20871506962223468,
+   "decode": 0.20871506962223468
+  }
+ },
+ "code_prefill": {
+  "solo_s_per_100k": 24.77,
+  "with_other_s_per_100k": 59.353821476548035,
+  "chunk_tokens": 4096
+ },
+ "sim": {
+  "transaction_fixed_s": 0.05857168138027191,
+  "move_s": 0.08229916170239449,
+  "move_s_during_code_prefill": 3.6131298886612058
+ },
+ "fit": {
+  "none_n": 905,
+  "none_rmse_s": 0.0007469565210633029,
+  "interference_n": {
+   "prefill": 226,
+   "decode": 69
+  },
+  "code_single_n": 6,
+  "code_tpot_with_conv_s": 0.22513906962223468
+ }
+}
