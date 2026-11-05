@@ -126,6 +126,32 @@ class PlacementScheduler(Scheduler):
         self.placement_transaction = None
         self.placement_unreserved = {}
         self.placement_decode_progress = {}
+        # Admission mode. "full": reserve prompt + max_tokens (legacy; max_tokens is the replayed true length, an
+        # oracle). "prompt": reserve only the current length (prompt + `placement_reserve_extra`), then grow per step;
+        # a shortage triggers vLLM's recompute preemption (retract). "native": stock vLLM admission.
+        self.placement_mode = "full"
+        self.placement_reserve_extra = 0
+        self.placement_preemptions = 0
+        self.placement_recompute_tokens = 0
+
+    def _preempt_request(self, request, *args, **kwargs):
+        self.placement_preemptions += 1
+        self.placement_recompute_tokens += request.num_computed_tokens
+        return super()._preempt_request(request, *args, **kwargs)
+
+    def placement_set_mode(self, mode, reserve_extra=0):
+        if mode not in ("full", "prompt", "native"):
+            raise ValueError(f"Unknown admission mode {mode}")
+        if self.requests or self.placement_pending or self.placement_transaction is not None:
+            raise RuntimeError("Switch admission mode only on an idle scheduler")
+        self.placement_mode, self.placement_reserve_extra = mode, int(reserve_extra)
+        return {"mode": self.placement_mode, "reserve_extra": self.placement_reserve_extra,
+                "preemptions_total": self.placement_preemptions}
+
+    def _reservation_tokens(self, request):
+        if self.placement_mode == "full":
+            return request.num_prompt_tokens + request.max_tokens
+        return request.num_prompt_tokens + self.placement_reserve_extra
 
     def placement_snapshot(self, refresh_physical_capacity=False):
         manager = self.kv_cache_manager.block_pool.kv_cache_manager
@@ -150,8 +176,7 @@ class PlacementScheduler(Scheduler):
                        and request.lora_request is None and not request.use_structured_output
                        and request.sampling_params.prompt_logprobs is None
                        and request.prompt_embeds is None and not request.resumable
-                       and not request.spec_token_ids and request._block_hasher is None
-                       and request.num_output_tokens < request.max_tokens)
+                       and not request.spec_token_ids and request._block_hasher is None)
             samples = progress.setdefault(request.request_id, [])
             if movable and self.pause_state != PauseState.PAUSED_ALL:
                 if not samples or observed_at - samples[-1][0] >= .5:
@@ -159,13 +184,12 @@ class PlacementScheduler(Scheduler):
                     samples[:] = samples[-8:]
             duration = samples[-1][0] - samples[0][0] if len(samples) > 1 else 0
             rate = ((samples[-1][1] - samples[0][1]) / duration if duration > 0 else 0)
-            remaining = (request.max_tokens - request.num_output_tokens) / rate if rate > 0 else None
             records.append({"id": request.request_id, "computed_tokens": request.num_computed_tokens,
                             "prompt_tokens": request.num_prompt_tokens, "output_tokens": request.num_output_tokens,
-                            "max_tokens": request.max_tokens, "blocks": blocks, "movable": bool(movable),
-                            "decode_rate_tokens_s": rate, "estimated_remaining_decode_s": remaining,
+                            "blocks": blocks, "movable": bool(movable), "decode_rate_tokens_s": rate,
                             "reserved_at": getattr(request, "placement_reserved_at", None),
-                            "reservation_pending": request.request_id in self.placement_unreserved})
+                            "reservation_pending": request.request_id in self.placement_unreserved,
+                            "reservation_tokens": self._reservation_tokens(request)})
         page_ids = list(manager.full_pages) + list(manager.avail_pages)
         null_pages = manager.page_allocator.group_indices_by_page([0], manager.block_mem_size)
         pages = [{"id": int(page_id), "owners": sorted(owners.get(page_id, set())),
@@ -189,14 +213,17 @@ class PlacementScheduler(Scheduler):
         running = {request.request_id for request in self.running}
         records = [{"id": request.request_id, "computed_tokens": request.num_computed_tokens,
                     "prompt_tokens": request.num_prompt_tokens, "output_tokens": request.num_output_tokens,
-                    "max_tokens": request.max_tokens,
                     "decoding": (request.request_id in running and not request.num_in_flight_tokens
                                  and request.num_computed_tokens >= request.num_prompt_tokens
                                  and request.num_output_tokens > 0),
                     "reserved_at": getattr(request, "placement_reserved_at", None),
-                    "reservation_pending": request.request_id in self.placement_unreserved}
+                    "reservation_pending": request.request_id in self.placement_unreserved,
+                    "reservation_tokens": self._reservation_tokens(request),
+                    "preemptions": getattr(request, "num_preemptions", 0)}
                    for request in self.requests.values()]
         return {"rank": self.parallel_config.data_parallel_rank, "requests": records,
+                "mode": self.placement_mode, "preemptions_total": self.placement_preemptions,
+                "recompute_tokens_total": self.placement_recompute_tokens,
                 "observed_at": time.monotonic(), "mapped_bytes": int(manager.get_mapped_memory_size()),
                 "page_bytes": manager._memory_limit_page_bundle_bytes(),
                 "block_bytes": manager.block_mem_size * manager.num_layers * manager.num_kv_buffers,
@@ -216,8 +243,8 @@ class PlacementScheduler(Scheduler):
         if self.pause_state != PauseState.PAUSED_ALL:
             raise RuntimeError("Pause DP group before beginning placement")
         observation = self.placement_snapshot()
-        if any(not request["movable"] for request in observation["requests"]):
-            raise ValueError("Controlled experiment requires an all-decode movable population")
+        # Waiting, prefilling or retracted requests may coexist with a transaction; only moved ones must be movable
+        # (placement_export checks each).
         self.placement_transaction = transaction
         return observation
 
@@ -289,11 +316,13 @@ class PlacementScheduler(Scheduler):
         return {"request_id": request_id, "request": pickle.dumps(request), "blocks": [blocks]}
 
     def add_request(self, request):
+        if self.placement_mode == "native":
+            return super().add_request(request)
         if request.request_id in self.requests or request.request_id in self.placement_pending:
             raise ValueError("Request identifier already exists")
-        total = request.num_prompt_tokens + request.max_tokens
+        total = self._reservation_tokens(request)
         if total > self.max_model_len:
-            raise ValueError("Full sequence reservation exceeds max_model_len")
+            raise ValueError("Reservation exceeds max_model_len")
         try:
             if self.kv_cache_manager.allocate_slots(request, total, has_scheduled_reqs=False) is None:
                 self.kv_cache_manager.free(request)
@@ -313,7 +342,7 @@ class PlacementScheduler(Scheduler):
                 continue
             if self.pause_state == PauseState.PAUSED_ALL or os.environ.get("DP_OPT_CONTROLLED_RESERVATION_RETRY") == "1":
                 break
-            total = request.num_prompt_tokens + request.max_tokens
+            total = self._reservation_tokens(request)
             try:
                 allocation = self.kv_cache_manager.allocate_slots(request, total, has_scheduled_reqs=False)
             except BaseException:
@@ -356,7 +385,7 @@ class PlacementScheduler(Scheduler):
             return {"reservation_pending": True, "reserved_at": None}
         try:
             allocation = self.kv_cache_manager.allocate_slots(
-                request, request.num_prompt_tokens + request.max_tokens, has_scheduled_reqs=False)
+                request, self._reservation_tokens(request), has_scheduled_reqs=False)
         except BaseException:
             self.kv_cache_manager.free(request)
             raise
@@ -432,7 +461,7 @@ def bind_engine(engine):
     elif hasattr(engine, "_has_global_unfinished_reqs"):
         install_boundary_pause(engine)
     for name in ("snapshot", "summary", "begin", "export", "prepare", "commit", "remove", "rollback", "end",
-                 "retry_reservation"):
+                 "retry_reservation", "set_mode"):
         setattr(engine, "placement_" + name, getattr(engine.scheduler, "placement_" + name))
 
     def release(transaction, request_id, rollback=False):

@@ -118,26 +118,74 @@ async def run_phases(engines, args, bank, bank_sha, mark, verify=True):
             save(calibration / "step-params.json", step_params)
             mark(phase, status, fit=step_params.get("fit"))
         elif phase == "trace":
-            trace_bytes = args.trace.read_bytes()
-            trace = json.loads(trace_bytes)
-            if trace.get("prompt_bank_sha256") not in (None, bank_sha):
-                raise ValueError("Trace prompt bank checksum differs from the supplied bank")
-            controller.budgets = list(budget["budget_gib"])
-            trace_args = argparse.Namespace(
-                planner_params=json.loads(args.planner_params.read_text()) if args.planner_params else {},
-                step_params=step_params, trace_sha256=hashlib.sha256(trace_bytes).hexdigest(), seed=args.seed,
-                fairness_threshold_s=args.fairness_threshold_s, blocked_recheck_s=2.0, plan_retry_s=2.0,
-                poll_s=.25, return_period_s=10.0, return_cooldown_s=10.0, monitor_s=5.0,
-                drain_timeout_s=args.drain_timeout_s)
-            for policy in args.policies.split(","):
-                if policy not in POLICIES:
-                    raise ValueError(f"Unknown policy {policy}")
-                mark(f"trace:{policy}", "started")
-                summary = await run_trace(engines, controller, trace, bank, policy, output / "trace" / policy,
-                                          trace_args)
-                mark(f"trace:{policy}", summary["status"], summary=summary)
+            segments = trace_segments(args)
+            loaded = []
+            for label, trace_path, cap_gib, policies in segments:  # validate every segment before running any
+                trace_bytes = trace_path.read_bytes()
+                trace = json.loads(trace_bytes)
+                if trace.get("prompt_bank_sha256") not in (None, bank_sha):
+                    raise ValueError(f"Trace {trace_path.name}: prompt bank checksum differs from the supplied bank")
+                unknown = [policy for policy in policies if policy not in POLICIES]
+                if unknown:
+                    raise ValueError(f"Unknown policy {unknown[0]}")
+                loaded.append((label, trace, hashlib.sha256(trace_bytes).hexdigest(), cap_gib, policies))
+            for label, trace, trace_sha256, cap_gib, policies in loaded:
+                controller.budgets = list(budget["budget_gib"])
+                trace_args = argparse.Namespace(
+                    planner_params=json.loads(args.planner_params.read_text()) if args.planner_params else {},
+                    step_params=step_params, trace_sha256=trace_sha256, seed=args.seed,
+                    fairness_threshold_s=args.fairness_threshold_s, blocked_recheck_s=2.0, plan_retry_s=2.0,
+                    poll_s=.25, return_period_s=10.0, return_cooldown_s=10.0, monitor_s=5.0,
+                    drain_timeout_s=args.drain_timeout_s,
+                    kv_utilization=float(os.environ.get("KVCACHED_GPU_UTILIZATION", "0.95")),
+                    kv_mode=getattr(args, "kv_mode", "full"),
+                    reserve_extra_tokens=getattr(args, "reserve_extra_tokens", 0))
+                # a labelled segment writes trace/<label>/<policy> and marks <label>/<policy>
+                root = output / "trace" if label is None else output / "trace" / label
+                name = (lambda policy: policy) if label is None else (lambda policy: f"{label}/{policy}")
+                stem = (lambda policy: policy) if label is None else (lambda policy: f"{label}-{policy}")
+                for policy in policies:
+                    # Without the legacy controller-enforced reservation, KV grows per step, so the budget must be
+                    # the physical capacity kvcached sees: trim free memory (ballast) around every such trial.
+                    capped = bool(POLICIES[policy].get("native")) or trace_args.kv_mode != "full"
+                    if capped:
+                        if not cap_gib:
+                            raise ValueError("Per-step KV growth needs --budget-cap-gib to size the shared KV capacity")
+                        ballast = await controller.apply_ballast(cap_gib, trace_args.kv_utilization)
+                        save(output / f"ballast-{stem(policy)}.json", ballast)
+                        mark(f"ballast:{name(policy)}", "applied", capacity_gib=ballast["capacity_gib"])
+                        # plan against what kvcached can actually map: whole page bundles under the ballast
+                        controller.budgets = [ballast["pages"] * ballast["page_bytes"] / 1024**3] * args.num_ranks
+                    mark(f"trace:{name(policy)}", "started")
+                    try:
+                        summary = await run_trace(engines, controller, trace, bank, policy, root / policy, trace_args)
+                    finally:
+                        if capped:
+                            controller.budgets = list(budget["budget_gib"])
+                            released = await controller.release_ballast(trace_args.kv_utilization)
+                            save(output / f"ballast-{stem(policy)}-released.json", released)
+                            mark(f"ballast:{name(policy)}", "released", capacity_gib=released["capacity_gib"])
+                    mark(f"trace:{name(policy)}", summary["status"], summary=summary)
             mark(phase, "passed")
     return controller
+
+
+def trace_segments(args):
+    """[(label, trace path, KV cap GiB, policies)] run in order in one allocation.
+
+    Without --segments: one unlabelled segment from --trace, --budget-cap-gib and --policies (output layout
+    trace/<policy>). A segments file holds {"segments": [{"label", "trace", "budget_cap_gib", "policies"}]}, trace paths
+    relative to the file; each segment writes trace/<label>/<policy>.
+    """
+    path = getattr(args, "segments", None)
+    if path is None:
+        return [(None, args.trace, args.budget_cap_gib, args.policies.split(","))]
+    segments = [(item["label"], path.parent / item["trace"], item.get("budget_cap_gib", args.budget_cap_gib),
+                 list(item["policies"])) for item in json.loads(path.read_text())["segments"]]
+    labels = [label for label, *_ in segments]
+    if not segments or len(set(labels)) != len(labels) or any(not label or "/" in label for label in labels):
+        raise ValueError(f"Segments need unique, non-empty labels without '/': {labels}")
+    return segments
 
 
 async def run(args):
@@ -203,9 +251,16 @@ def parse_args(argv=None):
     parser.add_argument("--fairness-threshold-s", type=float, default=30.0)
     parser.add_argument("--drain-timeout-s", type=float, default=5400.0)
     parser.add_argument("--probe-max-ms", type=float, help="abort if the Conv bal8 probe step exceeds this")
+    parser.add_argument("--kv-mode", choices=("full", "prompt"), default="full",
+                        help="controlled admission: full = prompt+output reservation (legacy, uses the replayed "
+                             "output length); prompt = current length only, per-step growth, vLLM retract")
+    parser.add_argument("--reserve-extra-tokens", type=int, default=0,
+                        help="fixed tokens reserved beyond the prompt under --kv-mode prompt")
+    parser.add_argument("--segments", type=Path,
+                        help="JSON list of {label, trace, budget_cap_gib, policies} run in order (replaces --trace)")
     args = parser.parse_args(argv)
-    if "trace" in args.phases.split(",") and args.trace is None:
-        parser.error("--trace is required for the trace phase")
+    if "trace" in args.phases.split(",") and args.trace is None and args.segments is None:
+        parser.error("--trace or --segments is required for the trace phase")
     return args
 
 

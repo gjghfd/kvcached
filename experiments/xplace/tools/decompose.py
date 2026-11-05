@@ -71,6 +71,8 @@ def decompose(root, window):
     covered = {"prefill": overlap(*horizon, prefill) / span, "decode": overlap(*horizon, decode) / span,
                "paused": overlap(*horizon, paused) / span}
     states = sorted(contribution, key=lambda key: -contribution[key])
+    if n == 0:  # e.g. a censored trial where no Conv of the window completed
+        return {"conv_n": 0, "tpot_avg_ms": float("nan"), "states": {}, "code_residency_share": covered}
     return {"conv_n": n, "tpot_avg_ms": 1e3 * sum(contribution.values()) / n,
             "states": {state: {"tpot_contribution_ms": 1e3 * contribution[state] / n,
                                "token_share": tokens[state] / sum(tokens.values()),

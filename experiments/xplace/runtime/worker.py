@@ -88,6 +88,25 @@ class VerificationWorker(Worker):
                 "torch_reserved_mib": torch.cuda.memory_reserved(self.device) / 1024**2,
                 "released_unused_allocator_cache": release_unused}
 
+    def placement_ballast(self, num_bytes):
+        """Hold `num_bytes` more device memory; kvcached sizes every co-located pool from cudaMemGetInfo."""
+        held = self.__dict__.setdefault("_placement_ballast", [])
+        if num_bytes > 0:
+            held.append(torch.empty(int(num_bytes), dtype=torch.uint8, device=self.device))
+        torch.cuda.synchronize(self.device)
+        free, total = torch.cuda.mem_get_info(self.device)
+        return {"held_bytes": sum(tensor.numel() for tensor in held), "free_mib": free / 1024**2,
+                "total_mib": total / 1024**2}
+
+    def placement_ballast_release(self):
+        held = self.__dict__.pop("_placement_ballast", [])
+        released = sum(tensor.numel() for tensor in held)
+        held.clear()
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+        free, total = torch.cuda.mem_get_info(self.device)
+        return {"released_bytes": released, "free_mib": free / 1024**2, "total_mib": total / 1024**2}
+
     def benefit_capture(self, command):
         if os.environ.get("DP_OPT_CAPTURE_EVIDENCE") != "1":
             raise RuntimeError("Capture evidence was not enabled before worker initialization")

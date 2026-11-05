@@ -4,10 +4,16 @@ import random
 from cost_model import capture_bucket, integrated_cost
 
 GIB = 1024**3
+# Output lengths are unknown online: every resident is assumed to keep decoding through the planning horizon.
+UNKNOWN_REMAINING = 10**9
 
 
-def build_state(observed, budgets):
-    """Compact planning view of full placement snapshots (observed[model][rank])."""
+def build_state(observed, budgets, growth_gib=(0.0, 0.0), slack_gib=0.0):
+    """Compact planning view of full placement snapshots (observed[model][rank]).
+
+    growth_gib[model]: KV one resident request of `model` may add within the planning window (decode rate x window,
+    never its unknown final length). Ranks whose usage a plan increases must keep that growth plus `slack_gib` free.
+    """
     num_ranks = len(observed[0])
     used = [sum(observed[model][rank]["mapped_bytes"] for model in (0, 1)) / GIB for rank in range(num_ranks)]
     requests, pools = [], {}
@@ -23,13 +29,55 @@ def build_state(observed, budgets):
             for request in observation["requests"]:
                 blocks = (request["num_blocks"] if "num_blocks" in request else len(request["blocks"])
                           if "blocks" in request else
-                          math.ceil((request["prompt_tokens"] + request["max_tokens"]) / observation["block_size"]))
+                          math.ceil(request["computed_tokens"] / observation["block_size"]))
                 requests.append({"id": request["id"], "model": model, "rank": rank,
-                                 "context": request["computed_tokens"],
-                                 "remaining": max(0, request["max_tokens"] - request["output_tokens"]),
+                                 "context": request["computed_tokens"], "remaining": UNKNOWN_REMAINING,
                                  "blocks": blocks, "movable": bool(request.get("movable", request.get("decoding")))})
     return {"num_ranks": num_ranks, "budgets": [float(value) for value in budgets], "used": used,
-            "requests": requests, "pools": pools}
+            "requests": requests, "pools": pools, "growth_gib": [float(value) for value in growth_gib],
+            "slack_gib": float(slack_gib)}
+
+
+def headroom_gib(state, counts, rank):
+    """Growth allowance a rank must keep free for its residents (counts[model][rank]) within the planning window."""
+    return sum(counts[model][rank] * state["growth_gib"][model] for model in (0, 1)) + state["slack_gib"]
+
+
+def resident_counts(state, moves=(), arrival=None, target=None):
+    destination = {move["id"]: move["destination"] for move in moves}
+    counts = [[0] * state["num_ranks"] for _ in (0, 1)]
+    for request in state["requests"]:
+        counts[request["model"]][destination.get(request["id"], request["rank"])] += 1
+    if arrival is not None:
+        counts[arrival["model"]][target] += 1
+    return counts
+
+
+def conv_growth_tokens(model, params, conv_counts, conv_contexts, arrival_prompt=None, isolate=False,
+                       slice_cfg=None):
+    """Tokens one resident Conv may decode within the planning window (output length unknown, so rate x time).
+
+    At least `relief_horizon_s` at the solo rate, so a rank receiving requests keeps room until the next rebalance.
+    For a long arrival, also its residency (calibrated prefill time + `decode_window_s`) at the rate Conv runs during
+    it: interfered when the tenants co-run, only within slices under time-multiplexing, zero for a plain hold.
+    """
+    solo = model.decode_step(1, conv_counts, conv_contexts) or 0.02
+    tokens = params["relief_horizon_s"] / solo
+    if arrival_prompt:
+        prefill = model.params.get("code_prefill", {})
+        per_100k = prefill.get("solo_s_per_100k" if isolate else "with_other_s_per_100k", 54.0)
+        if isinstance(per_100k, dict):
+            per_100k = max(float(value) for value in per_100k.values())
+        window = arrival_prompt / 100000 * float(per_100k) + params["decode_window_s"]
+        if not isolate:
+            during = window / (model.decode_step(1, conv_counts, conv_contexts, "prefill") or solo)
+        elif slice_cfg:
+            period = slice_cfg[2] if len(slice_cfg) == 3 else slice_cfg[0]
+            during = (math.ceil(window / period) + 1) * slice_cfg[1] / solo
+        else:
+            during = 0.0
+        tokens = max(tokens, during)
+    return tokens
 
 
 def pool_increment(pool, blocks):
@@ -44,15 +92,19 @@ def released_gib(state, rank, identifiers):
 
 
 def plan_usage(state, moves, arrival=None, target=None):
-    """Per-rank KV usage after moves (+ arrival at target) under the conservative page model, or None."""
+    """Per-rank KV usage after moves (+ arrival at target) under the conservative page model, or None.
+
+    Ranks whose usage grows must also keep the growth headroom of their residents after the plan.
+    """
     used = list(state["used"])
-    sources, added = {}, {}
+    sources, added, released = {}, {}, {}
     for move in moves:
         sources.setdefault(move["source"], set()).add(move["id"])
         key = (move["model"], move["destination"])
         added[key] = added.get(key, 0) + move["blocks"]
     for rank, identifiers in sources.items():
-        used[rank] -= released_gib(state, rank, frozenset(identifiers))
+        released[rank] = released_gib(state, rank, frozenset(identifiers))
+        used[rank] -= released[rank]
     for (model, rank), blocks in added.items():
         pool = state["pools"][(model, rank)]
         if blocks > pool["free_blocks"]:
@@ -61,11 +113,14 @@ def plan_usage(state, moves, arrival=None, target=None):
     if arrival is not None:
         pool = state["pools"][(arrival["model"], target)]
         blocks = math.ceil(arrival["tokens"] / pool["block_size"])
-        if blocks > pool["free_blocks"]:
+        if blocks > pool["free_blocks"] + int(released.get(target, 0.0) / pool["block_gib"] + 1e-9):
             return None
         used[target] += pool_increment(pool, blocks)
-    if any(value > budget + 1e-6 for value, budget in zip(used, state["budgets"])):
-        return None
+    counts = resident_counts(state, moves, arrival, target)
+    for rank, (value, budget) in enumerate(zip(used, state["budgets"])):
+        grew = value > state["used"][rank] + 1e-9
+        if value + (headroom_gib(state, counts, rank) if grew else 0.0) > budget + 1e-6:
+            return None
     return used
 
 
@@ -77,7 +132,7 @@ def layout(state, moves=(), arrival=None, target=None):
         tenants[request["model"]].append((destination.get(request["id"], request["rank"]),
                                           request["context"], request["remaining"]))
     if arrival is not None:
-        tenants[arrival["model"]].append((target, arrival["prompt_tokens"], arrival["output_tokens"]))
+        tenants[arrival["model"]].append((target, arrival["prompt_tokens"], UNKNOWN_REMAINING))
     return tenants
 
 
@@ -132,7 +187,10 @@ def _assign(state, model, selected, target, used, rng, cost_aware, arrival=None)
             if blocks > pool["free_blocks"]:
                 continue
             increment = pool_increment(pool, blocks) - pool_increment(pool, added.get(key, 0))
-            if used[destination] + increment > state["budgets"][destination] + 1e-6:
+            trial = {tenant: list(values) for tenant, values in counts.items()}
+            trial[request["model"]][destination] += 1
+            if (used[destination] + increment + headroom_gib(state, trial, destination)
+                    > state["budgets"][destination] + 1e-6):
                 continue
             options.append((destination, increment))
         if not options:
@@ -166,7 +224,14 @@ def _assign(state, model, selected, target, used, rng, cost_aware, arrival=None)
 
 
 def _select_for_target(state, target, arrival, ordered, max_moves):
-    """Shortest prefix of `ordered` whose release lets the arrival fit on `target` (ignoring destinations)."""
+    """Shortest prefix of `ordered` whose release lets the arrival fit on `target` (ignoring destinations), keeping
+    the growth headroom of what stays on `target` plus the arrival.
+
+    The arrival needs physically free blocks: kvcached reports free_blocks = this pool's holes + physically free
+    pages, so pages released by the moves add to it (both tenants map the same physical memory)."""
+    base = resident_counts(state, arrival=arrival, target=target)
+    pool = state["pools"][(arrival["model"], target)]
+    blocks = math.ceil(arrival["tokens"] / pool["block_size"])
     selected = []
     for request in [None] + ordered:
         if request is not None:
@@ -174,20 +239,21 @@ def _select_for_target(state, target, arrival, ordered, max_moves):
                 return None
             selected.append(request)
         identifiers = frozenset(item["id"] for item in selected)
-        pool = state["pools"][(arrival["model"], target)]
-        blocks = math.ceil(arrival["tokens"] / pool["block_size"])
-        if blocks > pool["free_blocks"]:
-            return None
-        used = state["used"][target] - released_gib(state, target, identifiers) + pool_increment(pool, blocks)
-        if used <= state["budgets"][target] + 1e-6:
+        released = released_gib(state, target, identifiers)
+        if blocks > pool["free_blocks"] + int(released / pool["block_gib"] + 1e-9):
+            continue
+        counts = [list(values) for values in base]
+        for item in selected:
+            counts[item["model"]][target] -= 1
+        used = state["used"][target] - released + pool_increment(pool, blocks)
+        if used + headroom_gib(state, counts, target) <= state["budgets"][target] + 1e-6:
             return selected
     return None
 
 
 ORDERINGS = {
     "kv_desc": lambda request: (-request["blocks"], request["id"]),
-    "remaining_asc": lambda request: (request["remaining"], -request["blocks"], request["id"]),
-    "remaining_desc": lambda request: (-request["remaining"], -request["blocks"], request["id"]),
+    "kv_asc": lambda request: (request["blocks"], request["id"]),
 }
 
 
@@ -203,7 +269,7 @@ def plan_admission(state, arrival, policy, model, params, seed=0):
     num_ranks = state["num_ranks"]
     movable = [request for request in state["requests"] if request["movable"] and request["model"] != arrival["model"]]
     horizon = horizon_steps(state, model, params)
-    candidates = []
+    candidates, diagnostics = [], []
     targets = list(range(num_ranks))
     if policy == "mig_random":
         rng.shuffle(targets)
@@ -211,17 +277,22 @@ def plan_admission(state, arrival, policy, model, params, seed=0):
     for target in targets:
         on_target = [request for request in movable if request["rank"] == target]
         orderings = list(ORDERINGS) if policy == "ca" else ["kv_desc"]
+        stages = []
         for name in orderings:
             selected = _select_for_target(state, target, arrival,
                                           sorted(on_target, key=ORDERINGS[name]), params["max_moves"])
             if selected is None:
+                stages.append("select")
                 continue
             moves = _assign(state, model, selected, target, list(state["used"]), rng, mode, arrival)
             if moves is None:
+                stages.append("assign")
                 continue
             used = plan_usage(state, moves, arrival, target)
             if used is None:
+                stages.append("usage")
                 continue
+            stages.append("ok")
             candidate = {"target": target, "moves": moves, "ordering": name, "used_after_gib": used}
             if policy == "mig_random":
                 candidate["selection"] = "first_feasible_in_random_target_order"
@@ -234,8 +305,18 @@ def plan_admission(state, arrival, policy, model, params, seed=0):
             candidate.update(performance_cost_s=performance, migration_cost_s=migration_cost(state, moves, params),
                              objective_s=performance + migration_cost(state, moves, params))
             candidates.append(candidate)
+        if "ok" not in stages:
+            pool = state["pools"][(arrival["model"], target)]
+            residents = [request for request in state["requests"] if request["rank"] == target
+                         and request["model"] != arrival["model"]]
+            diagnostics.append({
+                "target": target, "stages": stages, "residents": len(residents), "movable": len(on_target),
+                "need_blocks": math.ceil(arrival["tokens"] / pool["block_size"]), "free_blocks": pool["free_blocks"],
+                "released_if_all_moved_gib": released_gib(state, target, frozenset(item["id"] for item in on_target)),
+                "used_gib": state["used"][target], "budget_gib": state["budgets"][target]})
     if not candidates:
-        return {"target": None, "moves": [], "reason": "no_feasible_plan", "horizon_steps": horizon}
+        return {"target": None, "moves": [], "reason": "no_feasible_plan", "horizon_steps": horizon,
+                "diagnostics": diagnostics}
     best = min(candidates, key=lambda item: (item["objective_s"], len(item["moves"]), item["target"]))
     return {**best, "candidates_evaluated": len(candidates), "horizon_steps": horizon,
             "alternatives": [{key: item.get(key) for key in ("target", "ordering", "objective_s", "performance_cost_s",
@@ -290,8 +371,8 @@ def _level_moves(state, tenant, level, key, max_moves):
 
 
 RETURN_KEYS = {
-    "remaining_desc": lambda request: (-request["remaining"], -request["context"], request["id"]),
-    "context_desc": lambda request: (-request["context"], -request["remaining"], request["id"]),
+    "context_asc": lambda request: (request["context"], request["id"]),
+    "context_desc": lambda request: (-request["context"], request["id"]),
 }
 
 
@@ -340,4 +421,6 @@ def plan_return(state, model, params):
 
 DEFAULT_PARAMS = {"max_moves": 8, "return_max_moves": 12, "horizon_s": 90.0, "pause_fixed_s": 1.0,
                   "move_fixed_s": 0.05, "copy_gib_s": 10.0, "return_margin_s": 5.0, "return_margin_ratio": 0.5,
-                  "code_rate": 0.002, "code_need_gib": 9.375, "migrate_min_gib": 4.0}
+                  "code_rate": 0.002, "code_need_gib": 9.375, "migrate_min_gib": 4.0,
+                  # current-length admission: growth headroom (see conv_growth_tokens) and per-rank slack pages
+                  "relief_horizon_s": 15.0, "decode_window_s": 10.0, "slack_pages": 1}

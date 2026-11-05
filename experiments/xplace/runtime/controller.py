@@ -26,16 +26,18 @@ def used_gib(observations):
             for rank in range(len(observations[0]))]
 
 
-def fits(observations, model, rank, tokens, budgets, used=None):
+def fits(observations, model, rank, tokens, budgets, used=None, headroom=0.0):
     used = used_gib(observations) if used is None else used
     observation = observations[model][rank]
-    return (used[rank] + allocation_increment(observation, tokens) <= budgets[rank] + 1e-6
+    return (used[rank] + allocation_increment(observation, tokens) + headroom <= budgets[rank] + 1e-6
             and math.ceil(tokens / observation["block_size"]) <= observation["free_blocks"])
 
 
-def direct_candidates(observations, model, tokens, budgets):
+def direct_candidates(observations, model, tokens, budgets, headroom=None):
     used = used_gib(observations)
-    return used, [rank for rank in range(len(budgets)) if fits(observations, model, rank, tokens, budgets, used)]
+    headroom = headroom or [0.0] * len(budgets)
+    return used, [rank for rank in range(len(budgets))
+                  if fits(observations, model, rank, tokens, budgets, used, headroom[rank])]
 
 
 def count_least_loaded(observations, model, candidates, used):
@@ -66,6 +68,8 @@ class PlacementController:
         self.code_view = None
         self.code_epoch = 0
         self.view_stats = {"cached": 0, "fetched": 0}
+        # Native runs cap KV physically (ballast) instead of through admission, so the budget is observed, not enforced.
+        self.enforce_budget = True
 
     async def tenant_summaries(self, model):
         return list(await asyncio.gather(*[self.call(model, rank, "placement_summary")
@@ -124,9 +128,56 @@ class PlacementController:
 
     def check_capacity(self, observations):
         used = used_gib(observations)
-        if any(used[rank] > self.budgets[rank] + 1e-6 for rank in range(self.num_ranks)):
+        if self.enforce_budget and any(used[rank] > self.budgets[rank] + 1e-6 for rank in range(self.num_ranks)):
             raise MemoryError(f"Mapped KV {used} exceeds controlled budget {self.budgets}")
         return used
+
+    async def set_mode(self, mode, reserve_extra=0):
+        """Switch every scheduler's admission mode: "full" (legacy prompt+max_tokens), "prompt" (current length,
+        then per-step growth with vLLM retract) or "native" (stock vLLM)."""
+        return await self.gather("placement_set_mode", mode, int(reserve_extra))
+
+    def kv_capacity(self, memory, summaries, utilization):
+        """Per-GPU KV bytes kvcached can map for both tenants: mapped + free - headroom (kvcached keeps
+        (1 - utilization) of total memory free, see page_allocator get_avail_physical_pages)."""
+        capacity = []
+        for rank in range(self.num_ranks):
+            free = min(memory[model][rank][0]["free_mib"] for model in (0, 1)) * 1024**2
+            total = memory[0][rank][0]["total_mib"] * 1024**2
+            mapped = sum(summaries[model][rank]["mapped_bytes"] for model in (0, 1))
+            capacity.append(mapped + free - total * (1 - utilization))
+        return capacity
+
+    async def apply_ballast(self, cap_gib, utilization):
+        """Hold device memory so each GPU's shared KV capacity is floor(cap / page) whole page bundles, as under the
+        controlled budget. The first pass undershoots by a quarter page so no pass ever needs to give memory back."""
+        summaries = await self.summaries()
+        page = summaries[0][0]["page_bytes"]
+        target = (math.floor(cap_gib * GIB / page) + 0.5) * page
+        natural = self.kv_capacity(await self.memory(), summaries, utilization)
+        if any(value < target for value in natural):
+            raise RuntimeError(f"Natural KV capacity {natural} is below the native target {target / GIB:.3f} GiB")
+        capacity = natural
+        for slack in (0.25 * page, 0.0):
+            excess = [max(0, int(value - target - slack)) for value in capacity]
+            share = (0, 1) if slack else (0,)
+            await asyncio.gather(*[self.call(model, rank, "collective_rpc", "placement_ballast", 120,
+                                             (excess[rank] // len(share),), {})
+                                   for rank in range(self.num_ranks) for model in share])
+            capacity = self.kv_capacity(await self.memory(), await self.summaries(), utilization)
+        if any(abs(value - target) > 0.25 * page for value in capacity):
+            raise RuntimeError(f"Ballast missed the KV target {target / GIB:.3f} GiB: {capacity}")
+        return {"cap_gib": cap_gib, "utilization": utilization, "page_bytes": page, "target_gib": target / GIB,
+                "pages": math.floor(cap_gib * GIB / page), "natural_capacity_gib": [value / GIB for value in natural],
+                "capacity_gib": [value / GIB for value in capacity]}
+
+    async def release_ballast(self, utilization):
+        released = await asyncio.gather(*[self.call(model, rank, "collective_rpc", "placement_ballast_release", 120,
+                                                    (), {})
+                                          for model in (0, 1) for rank in range(self.num_ranks)])
+        capacity = self.kv_capacity(await self.memory(), await self.summaries(), utilization)
+        return {"released_bytes": sum(item[0]["released_bytes"] for item in released),
+                "capacity_gib": [value / GIB for value in capacity]}
 
     async def pause_boundary(self, observations, models=(0, 1)):
         counts = [sum(len(rank["requests"]) for rank in ranks) for ranks in observations]
@@ -208,7 +259,7 @@ class PlacementController:
                 return {"reservation_pending": True, "reserved_at": None, "missing": True}
             if not record["reservation_pending"]:
                 return {"reservation_pending": False, "reserved_at": record["reserved_at"]}
-            tokens = record["prompt_tokens"] + record["max_tokens"]
+            tokens = record["reservation_tokens"]
             if fits(observations, model, rank, tokens, self.budgets):
                 if model == 0:
                     self.begin_code_change()
@@ -219,14 +270,16 @@ class PlacementController:
                         "reserved_at": result.get("reserved_at")}
             return {"reservation_pending": True, "reserved_at": None}
 
-    async def try_direct_admission(self, model, tokens, admit, route=None, before_admit=None):
+    async def try_direct_admission(self, model, tokens, admit, route=None, before_admit=None, headroom=None):
         async with self.lock:
             started = time.monotonic()
             observations = await self.admission_view(model)
-            used, candidates = direct_candidates(observations, model, tokens, self.budgets)
+            if callable(headroom):
+                headroom = headroom(observations)
+            used, candidates = direct_candidates(observations, model, tokens, self.budgets, headroom)
             report = {"path": "direct", "model": model, "tokens": tokens, "used_gib": used,
                       "counts": [[len(rank["requests"]) for rank in ranks] for ranks in observations],
-                      "candidates": candidates, "admitted": False, "target": None}
+                      "candidates": candidates, "admitted": False, "target": None, "headroom_gib": headroom}
             if candidates:
                 target = (route or count_least_loaded)(observations, model, candidates, used)
                 if before_admit is not None:
@@ -248,11 +301,13 @@ class PlacementController:
             report["observations"] = observations
             return report
 
-    async def run_transaction(self, plan_fn, label, admission=None, admit=None, pause_models=(0, 1), hold_after=()):
+    async def run_transaction(self, plan_fn, label, admission=None, admit=None, pause_models=(0, 1), hold_after=(),
+                              admission_headroom=None):
         """Pause `pause_models` at a DP boundary, apply plan_fn's moves, optionally admit, then resume.
 
-        Only tenants whose requests move need pausing: an unpaused tenant cannot grow KV (full reservations) and its
-        admissions are serialized by the controller lock, so its snapshot is a conservative capacity view.
+        Only tenants whose requests move need pausing. An unpaused tenant may still grow KV per step, so the
+        admission is re-checked on fresh snapshots after the moves (with `admission_headroom(current)` for the target).
+        Waiting or retracted requests may coexist; the planner only moves movable (decoding) requests.
         Tenants in `hold_after` stay paused as held after a successful admission (time-multiplexing).
         """
         pause_models = tuple(sorted(set(pause_models)))
@@ -261,11 +316,6 @@ class PlacementController:
             summaries = await self.summaries()
             report = {"path": label, "started_at": started, "moves": [], "admitted": False, "status": None,
                       "pause_models": list(pause_models)}
-            if not all(request["decoding"] for model in pause_models for rank in summaries[model]
-                       for request in rank["requests"]):
-                report.update(status="deferred_prefill_in_progress", control_s=time.monotonic() - started,
-                              observations=summaries)
-                return report
             transaction = uuid.uuid4().hex
             # Held tenants are already paused (time-multiplexing) and stay paused after the transaction.
             to_pause = tuple(model for model in pause_models if model not in self.held)
@@ -276,14 +326,10 @@ class PlacementController:
             report["pause_wait_s"] = paused_at - started
             completed = False
             try:
-                observed = await self.snapshots()
-                if any(not request["movable"] for model in pause_models for rank in observed[model]
-                       for request in rank["requests"]):
-                    report["status"] = "deferred_not_movable_after_pause"
-                    completed = True
-                    return report
                 if pause_models:
                     observed = await self.begin(transaction, pause_models)
+                else:
+                    observed = await self.snapshots()
                 solve_started = time.monotonic()
                 plan = await asyncio.to_thread(plan_fn, observed)
                 report.update(solve_s=time.monotonic() - solve_started, plan=plan, observations=observed)
@@ -303,7 +349,9 @@ class PlacementController:
                 target = plan.get("target")
                 if (admission is not None and target is not None and "move_failure" not in report
                         and "dropped_unpaused_moves" not in report):
-                    if fits(current, admission["model"], target, admission["tokens"], self.budgets):
+                    margin = admission_headroom(current)[target] if admission_headroom is not None else 0.0
+                    report["admission_headroom_gib"] = margin
+                    if fits(current, admission["model"], target, admission["tokens"], self.budgets, headroom=margin):
                         if admission["model"] == 0:
                             self.begin_code_change()
                         reservation = await admit(target)

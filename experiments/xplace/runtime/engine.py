@@ -28,14 +28,20 @@ def engine_arguments(checkpoint, port, cache_bytes, max_model_len, num_ranks, gp
                                                "cudagraph_capture_sizes": list(SPARSE_CAPTURE_SIZES)})
 
 
-async def stream(engine, request_id, prompt, output_tokens, rank, model, role, arrived_at, stride=32):
-    """Stream one greedy request; cadence is sampled every `stride` tokens to bound log size."""
+async def stream(engine, request_id, prompt, output_tokens, rank, model, role, arrived_at, stride=32, progress=None):
+    """Stream one greedy request; cadence is sampled every `stride` tokens to bound log size.
+
+    `progress` (optional dict) is updated in place as tokens arrive, so a censored trial can record partial progress.
+    """
     import hashlib
 
     from vllm import SamplingParams
 
     submitted_at = time.monotonic()
     cadence, latest, first_token_at, previous, maximum_gap, bucket = [], None, None, None, 0.0, -1
+    if progress is not None:
+        progress.update(submitted_at=submitted_at, count=0, first_token_at=None, last_at=None, max_gap=0.0,
+                        cadence=cadence)
     async for output in engine.generate(
             {"prompt_token_ids": prompt}, SamplingParams(temperature=0, min_tokens=output_tokens,
                                                          max_tokens=output_tokens, ignore_eos=True),
@@ -51,6 +57,8 @@ async def stream(engine, request_id, prompt, output_tokens, rank, model, role, a
         if count // stride != bucket or count == output_tokens:
             cadence.append([now, count])
             bucket = count // stride
+        if progress is not None:
+            progress.update(count=count, first_token_at=first_token_at, last_at=now, max_gap=maximum_gap)
     if latest is None or len(latest.outputs[0].token_ids) != output_tokens or first_token_at is None:
         raise RuntimeError(f"Request {request_id} failed exact output-length/first-token check")
     tokens = list(latest.outputs[0].token_ids)

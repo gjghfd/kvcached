@@ -53,7 +53,9 @@ def sim_run(trace, policy, truth, belief, planner, budget, window, extra=None):
     result = metrics(out["requests"], 0.0, *window)
     result.update(mechanism(out["population"], code_spans(out["requests"], 0.0), window))
     result.update(moves=len(out["migrations"]), admissions=sum(d["kind"] == "admission" for d in out["decisions"]),
-                  returns=sum(d["kind"] == "return" and d["moves"] > 0 for d in out["decisions"]))
+                  returns=sum(d["kind"] == "return" and d["moves"] > 0 for d in out["decisions"]),
+                  preemptions=sum(out.get("preemptions", [0, 0])),
+                  wall_s=max(request["completed_at"] for request in out["requests"]))
     return result
 
 

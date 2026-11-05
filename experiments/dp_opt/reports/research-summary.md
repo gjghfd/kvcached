@@ -135,11 +135,13 @@
 - **新方向：分时**（用户同意）。Code 驻留期间暂停 Conv；vLLM DP 暂停期间 engine 完全空闲。simulator 预测 Conv TPOT −25~30%，Code TTFT 再降 58–80%。
 - **执行方式改为 ≤1h 短作业**（用户要求），12h 的 Job 2 已撤销。协议见 `xplace/docs/protocol.md` §6。
 
-### 4 卡最终结论（2026-11-04）
+### 4 卡结论：全量预留（2026-11-04，V1–V7，只作历史参考）
 
-详见 [xplace/reports/results-short.md](../../xplace/reports/results-short.md)。10 个作业，26 个 trial，同一节点、同一作业内配对，seed 702 与 704 两个 trace，每轮 4 个约 100K 的 Code。
+> 这一节的受控策略按 prompt + 回放的真实输出长度预留 KV，相当于预知输出长度（oracle）。用户 11-04 要求改为按当前长度准入，结果见下一节。
 
-- **A 成立**：迁移让 Code TTFT 降 45–59%，两个 seed 都复现。
+详见 [xplace/reports/results-short.md](../../xplace/reports/results-short.md)。12 个作业，36 个 trial，同一作业内配对，seed 702 与 704 两个 trace，每轮 4 个约 100K 的 Code。
+
+- **A 只相对全量预留成立**：迁移让 Code TTFT 降 45–59%（对按 P+O 全量预留的基线），两个 seed 都复现。但对 kvcached 原生部署（V7：原生准入、不加协调、共享 KV 对齐到 15.94 GiB/卡）没有收益（+0.5%）：原生按需分配让 4 个 Code 都到达即进入，0 次抢占，后两个 Code 的峰值离上限只剩 0.1–0.2 GiB。
 - **B 分两层**：
   - **加上分时等调度**：Conv TPOT 比 `no_move` 好 14–33%，Conv 不仅没退化，反而改善；
   - **placement 本身**：机制成立，cost-aware 回迁把可避免的 G16 占比从 0.41 降到 0.04–0.13；但端到端 ≤2.5%，小于干扰模式噪声（约 ±12%），同机配对中测不出。
@@ -148,10 +150,24 @@
   - v2 控制面：Conv TTFT −51%，分时下 Code TTFT 降到约 25s；
   - v3 分片分时：Conv TTFT p99 24 → 6s；
   - v3.1 按需切片：相对 v3，Code TTFT −11%，Conv SLO 1.00。
-- **最终推荐 `ca_full_tm_slo`**：对公平基线 `no_move_v2`（V6，最新代码，控制面版本一致，同机配对），Code TTFT −75%，Conv TPOT −21%，Conv TTFT 无显著差异，Conv/Code SLO 都是 1.00。
-- **placement 本身的 B 在不分时下为负**：两次独立配对中 `ca_full` 都比 `mig_random` 差（+2.4%、+7.1%）。无 Code 时段的机制有效，但 Code 驻留期间干扰更重。分时下两者无差别。
-- **控制器卡顿根因**：在共享文件系统上同步写 progress，v3.2 已改为后台线程写入。
-- **正确性**：11 个作业、32 个 trial，2168 个请求输出长度全部精确，159 次迁移全部逐字节校验通过。
+- **最终推荐 `ca_full_tm_slo`**：
+  - 对 kvcached 原生（V7，同机配对）：Code TTFT −49%，Conv TPOT −25%，Conv TTFT 0.25 → 0.66s，SLO 都是 1.00。这部分收益全部来自分时；
+  - 对公平基线 `no_move_v2`（V6/V7，控制面版本一致，同机配对）：Code TTFT −75% / −79%，Conv TPOT −21% / −15%，Conv/Code SLO 都是 1.00。
+- **placement 本身的 B 在不分时下为负**：两次独立配对中 `ca_full` 都比 `mig_random` 差（+2.4%、+7.1%）。无 Code 时段的机制有效，但 Code 驻留期间干扰更重。分时下两者无差别；原生 DP 负载均衡已把可避免的 G16 占比降到 0.02。
+- **控制器卡顿根因**：在共享文件系统上同步写 progress。v3.2 改为后台线程写入，V7 真机验证有效。
+- **正确性**：12 个作业、36 个 trial，2412 个请求输出长度全部精确，182 次迁移全部逐字节校验通过。
+
+### 4 卡结论：当前长度准入（2026-11-05，V8–V13）
+
+详见 [xplace/reports/results-short.md](../../xplace/reports/results-short.md) §12。受控策略只预留 prompt + 256 token，之后按步增长，KV 不够时由 vLLM 抢占重算；planner 不读输出长度。两个主 trace（seed 911、914，Conv 0.12 RPS，16 GiB/卡）加两个锚点（Conv 0.14 RPS；24 GiB/卡），各作业内配对。
+
+- **最终推荐 `ca_full_tm_slo`**：对控制器基线，Code TTFT −88.5% / −92.9%（两个 seed）、更重负载下 −95.3%，Conv TPOT 变化在 ±5% 内，Conv SLO 0.98–1.00，0 次抢占。
+- **原生 kvcached 在 16 GiB 下崩溃**：被 KV 挡住的请求让 DP 组空转，Conv 被拖到 300ms/token 以上，到 1900s 只完成约 1/3 的请求；24 GiB 下原生正常，与控制器基线相同。
+- **A 成立**：迁移让 Code TTFT 降 76–90%，但不分时下 Conv TPOT +39~47%，需要分时把它降回来。
+- **B 成立，幅度随运行变化**：代价感知 placement 相对随机迁移，分时下 −11.6% / −10.4% / −4.9%（三个 trace），不分时下 −2.0% 到 −6.1%（四次配对），全部为负。B 的大小取决于随机迁移会留下多少失衡（分时下约 −2.4%/单位）；代价感知回迁始终把失衡压在 1.3–2.5。
+- **为增长留空间主要靠持续回迁**：完整设计 16 轮 0 次抢占，迁移但不回迁的 9 轮共 22 次；准入时的增长余量只在更重的不分时负载下起作用（2 → 0 次）。
+- **KV 充足时没有碎片**，收益全部来自分时（Code TTFT −52.5%，Conv TPOT −26.1%）。
+- **正确性**：V10–V13 共 4554 个请求输出长度精确，933 次迁移全部逐字节校验通过。
 
 ## 5. 历史分篇报告导航
 

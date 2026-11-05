@@ -3,6 +3,14 @@
 Each tenant steps all DP ranks together. A Conv decode step costs StepModel(tenant 1); Code prefill runs one
 4096-token chunk per step. Cross-tenant interference applies while the other tenant has requests in flight.
 Migrations pause both tenants at a 32-step boundary (idle tenant first) and cost fixed + copy time.
+
+KV modes. "full" reserves prompt + output at admission (legacy: the output is the replayed true length, an oracle).
+"prompt" reserves only the prompt (+ a fixed extra) and grows one block per 16 decoded tokens. "native" (policy
+kvcached_native) is stock vLLM: count-based DP load balancing, a request starts once its current sequence fits on
+its rank, and a Code's prefill KV is allocated chunk by chunk. Outside "full", when a rank runs out of pages the
+tenant that needed the block retracts its newest request on that rank (vLLM FCFS preemption); the retracted request
+waits in that rank's queue until its current length fits again and recomputes it before decoding (a Code retracted
+mid-prefill restarts its prefill).
 """
 import hashlib
 import heapq
@@ -15,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime"))
 
 from cost_model import StepModel, capture_bucket  # noqa: E402
 from fairness import FairAdmissionGate  # noqa: E402
-from planner import DEFAULT_PARAMS, build_state, plan_admission, plan_return  # noqa: E402
+from planner import DEFAULT_PARAMS, build_state, conv_growth_tokens, plan_admission, plan_return  # noqa: E402
 
 BLOCK_TOKENS, PAGE_BLOCKS = 16, 64
 PAGE_BYTES, BLOCK_BYTES = 96 * 1024**2, int(1.5 * 1024**2)
@@ -30,6 +38,7 @@ POLICIES = {
     "ca_admit": {"admission": "ca", "return": False, "fair": False},
     "ca_return": {"admission": "mig_random", "return": True, "fair": False},
     "ca_full": {"admission": "ca", "return": True, "fair": False},
+    "kvcached_native": {"admission": None, "return": False, "fair": False, "native": True},
 }
 # Exploratory (simulator only): pause Conv while any Code request is resident (tenant time-multiplexing).
 for _name in ("no_move", "mig_random", "ca_full"):
@@ -37,9 +46,13 @@ for _name in ("no_move", "mig_random", "ca_full"):
 # v2: control-plane changes. Fast Conv admission is not modeled (no RPC latency here); hold_first delays Code
 # start until Conv reached its pause boundary.
 POLICIES["no_move_v2"] = dict(POLICIES["no_move"])
+POLICIES["no_move_fair_v2"] = dict(POLICIES["no_move_fair"])
 POLICIES["mig_random_v2"] = dict(POLICIES["mig_random"])
+POLICIES["ca_admit_v2"] = dict(POLICIES["ca_admit"])
+POLICIES["ca_return_v2"] = dict(POLICIES["ca_return"])
 POLICIES["ca_full_v2"] = dict(POLICIES["ca_full"])
 POLICIES["no_move_tm_v2"] = dict(POLICIES["no_move_tm"], hold_first=True)
+POLICIES["mig_random_tm_v2"] = dict(POLICIES["mig_random_tm"], hold_first=True)
 POLICIES["ca_full_tm_v2"] = dict(POLICIES["ca_full_tm"], hold_first=True)
 # Exploratory: sliced TM. After `slice[0]` s of Code prefill, pause the Code for a Conv window of `slice[1]` s
 # (plus the time Conv needs to reach its next pause boundary). Needs a per-step pausable Code tenant in live.
@@ -48,6 +61,9 @@ for _slice in ((3, 1.0), (5, 1.0), (10, 1.0), (5, 2.0)):
 POLICIES["ca_full_tm_s5"] = POLICIES["ca_full_tm_s5r1"]  # live policy name
 POLICIES["ca_full_tm_s4"] = dict(POLICIES["ca_full_tm_v2"], slice=(4.0, 1.0))
 POLICIES["ca_full_tm_slo"] = dict(POLICIES["ca_full_tm_v2"], slice=(2.0, 1.0, 15.0))
+# ablation (current-length setting): placement without growth headroom
+POLICIES["ca_full_tm_slo_nh"] = dict(POLICIES["ca_full_tm_slo"], no_headroom=True)
+POLICIES["ca_full_v2_nh"] = dict(POLICIES["ca_full_v2"], no_headroom=True)
 
 DEFAULT_SIM = {"num_ranks": 4, "budget_gib": 40.0, "pause_boundary": 32, "transaction_fixed_s": 0.3,
                "move_fixed_s": 0.05, "copy_gib_s": 10.0, "admission_overhead_s": 0.01,
@@ -59,24 +75,98 @@ DEFAULT_SIM = {"num_ranks": 4, "budget_gib": 40.0, "pause_boundary": 32, "transa
                # prefill, Code prefill speed factor ~ N(1, prefill_cv) (0: deterministic means)
                "interference_cv": 0.0, "prefill_cv": 0.0, "noise_seed": 0,
                # sliced TM: DP consensus after the Code keep-pause before Conv may run (live ~0.3 s)
-               "slice_consensus_s": 0.3}
+               "slice_consensus_s": 0.3,
+               # admission of controlled policies ("full" legacy oracle reservation or "prompt" current length)
+               "kv_mode": "full", "reserve_extra_tokens": 0,
+               # a retracted request recomputes prompt + generated tokens in 4096-token chunks before decoding
+               "recompute_s_per_token": 1.25e-4,
+               # outside "full": Conv pages are shared by the rank's Conv and stay mapped as a high-water mark
+               # (page_model "high_water", used by the forecasts up to V12)
+               "page_sharing": True,
+               # outside "full": "blocks" (per-page emulation of kvcached's allocator, PagePool) or "high_water"
+               "page_model": "blocks",
+               # an engine-internal queued request makes its DP group spin dummy batches that interfere
+               "dp_dummy_interference": True}
 
 
 class Request:
     __slots__ = ("mark", "id", "model", "prompt", "output", "arrival", "rank", "rank_initial", "reserved_at",
                  "first_token_at", "completed_at", "start_step", "chunks_left", "pages", "blocks", "moves", "path",
-                 "factor", "prefill_factor")
+                 "factor", "prefill_factor", "generated", "held_blocks", "order", "recompute_left", "preemptions",
+                 "ctx", "prefill_chunks", "holdings")
 
     def __init__(self, mark):
         self.mark, self.id, self.model = mark, mark["request_id"], mark["model"]
         self.prompt, self.output, self.arrival = mark["prompt_tokens"], mark["output_tokens"], mark["arrival_s"]
         self.rank = self.rank_initial = self.reserved_at = self.first_token_at = self.completed_at = None
         self.start_step = None
-        self.chunks_left = 0
-        self.blocks = math.ceil((self.prompt + self.output) / BLOCK_TOKENS)
+        self.chunks_left = self.prefill_chunks = 0
+        self.blocks = math.ceil((self.prompt + self.output) / BLOCK_TOKENS)  # legacy full reservation
         self.pages = math.ceil(self.blocks / PAGE_BLOCKS)
         self.moves, self.path = 0, None
         self.factor = self.prefill_factor = 1.0
+        self.generated = self.held_blocks = self.order = self.recompute_left = self.preemptions = 0
+        self.ctx = 0.0
+        self.holdings = {}  # page_model "blocks": page id -> blocks of this request on its rank
+
+
+class PagePool:
+    """kvcached's page allocator for one (tenant, rank) pool (`KVCacheManager._alloc_impl` / `_free`).
+
+    A one-block decode allocation goes to the fullest mapped page with room (`alloc_packed`); a run takes the
+    smallest page that holds all of it, else the emptiest page, and repeats. A new page is mapped only when no mapped
+    page has a free block, and a page is unmapped once all its blocks are free. Requests growing one block at a time
+    therefore interleave in the same pages, and moving some of a rank's requests frees only the pages they alone own.
+    """
+
+    def __init__(self):
+        self.free = {}  # mapped page id -> free blocks
+        self.owners = {}  # mapped page id -> {request id: blocks}
+        self.by_free = [set() for _ in range(PAGE_BLOCKS + 1)]
+        self.slots = 0  # free blocks in mapped pages
+        self.next_id = 0
+
+    def pages(self):
+        return len(self.free)
+
+    def _set_free(self, page, value):
+        self.by_free[self.free[page]].discard(page)
+        self.slots += value - self.free[page]
+        self.free[page] = value
+        self.by_free[value].add(page)
+
+    def _pick(self, need):
+        for free in range(min(need, PAGE_BLOCKS), PAGE_BLOCKS + 1):
+            if self.by_free[free]:
+                return min(self.by_free[free])
+        for free in range(min(need, PAGE_BLOCKS + 1) - 1, 0, -1):
+            if self.by_free[free]:
+                return min(self.by_free[free])
+        return None
+
+    def alloc(self, request, blocks, packed=False):
+        while blocks > 0:
+            page = self._pick(1 if packed else blocks)
+            if page is None:
+                page, self.next_id = self.next_id, self.next_id + 1
+                self.free[page], self.owners[page] = 0, {}
+                self.by_free[0].add(page)
+                self._set_free(page, PAGE_BLOCKS)
+            take = min(self.free[page], blocks)
+            self._set_free(page, self.free[page] - take)
+            self.owners[page][request.id] = self.owners[page].get(request.id, 0) + take
+            request.holdings[page] = request.holdings.get(page, 0) + take
+            blocks -= take
+
+    def release(self, request):
+        for page, count in request.holdings.items():
+            del self.owners[page][request.id]
+            self._set_free(page, self.free[page] + count)
+            if self.free[page] == PAGE_BLOCKS:
+                self.by_free[PAGE_BLOCKS].discard(page)
+                self.slots -= PAGE_BLOCKS
+                del self.free[page], self.owners[page]
+        request.holdings = {}
 
 
 class Tenant:
@@ -87,16 +177,21 @@ class Tenant:
         self.step_index, self.busy, self.paused, self.pause_pending, self.paused_at = 0, False, False, False, None
         self.held, self.hold_pending = False, False
         self.sliced = False
-        self.completions, self.in_step = [], []
+        self.in_step = []
+        self.waiting = [[] for _ in range(num_ranks)]  # vLLM-internal queues: native arrivals, retracted requests
+        self.blocks = [0] * num_ranks  # held KV blocks per rank (shared page pool)
+        # committed mapped pages per rank: Conv blocks grow one at a time into the fullest page with room, so the
+        # rank's requests share pages and freed blocks stay mapped as holes (refilled by growth) until the rank holds
+        # no Conv blocks at all (live: Conv mapped KV is a running high-water mark, V7/V8)
+        self.high_water = [0] * num_ranks
+        self.pools = [PagePool() for _ in range(num_ranks)]  # page_model "blocks"
+        self.next_rank = 0  # native DP load balancing: rotating scan start
 
     def has_work(self):
         return bool(self.active or self.joining)
 
-    def generated(self, request):
-        return 0 if request.start_step is None else self.step_index - request.start_step + 1
-
-    def current_context(self, request):
-        return request.prompt + self.generated(request)
+    def has_waiting(self):
+        return any(self.waiting)
 
 
 class Simulator:
@@ -109,6 +204,17 @@ class Simulator:
         self.num_ranks = self.params["num_ranks"]
         budget = self.params["budget_gib"]
         self.budgets = list(budget) if isinstance(budget, (list, tuple)) else [float(budget)] * self.num_ranks
+        self.native = bool(self.spec.get("native"))
+        self.mode = "native" if self.native else self.params["kv_mode"]
+        if self.mode not in ("full", "prompt", "native"):
+            raise ValueError(f"Unknown kv_mode {self.mode}")
+        if self.params["page_model"] not in ("high_water", "blocks"):
+            raise ValueError(f"Unknown page_model {self.params['page_model']}")
+        self.page_model = self.mode != "full" and self.params["page_model"] == "blocks"
+        self.capacity_pages = [math.floor(value / PAGE_GIB + 1e-9) for value in self.budgets]
+        if self.mode != "full":
+            # live plans against the ballast-capped capacity: whole page bundles
+            self.budgets = [pages * PAGE_GIB for pages in self.capacity_pages]
         self.truth = StepModel(step_params)
         self.belief = StepModel(planner_step_params or step_params)
         self.prefill = step_params.get("code_prefill", {"solo_s_per_100k": 26.4, "with_other_s_per_100k": 54.0})
@@ -116,7 +222,7 @@ class Simulator:
         self.now, self.sequence, self.events = 0.0, 0, []
         self.tenants = [Tenant(0, self.num_ranks), Tenant(1, self.num_ranks)]
         self.queues = [[], []]
-        self.used_pages = [2] * self.num_ranks
+        self.used_pages = [2] * self.num_ranks  # legacy full mode: per-request page sum
         self.transaction = None
         self.completed, self.decisions, self.migrations, self.population = [], [], [], []
         self.total = len(trace["requests"])
@@ -127,6 +233,8 @@ class Simulator:
         self.slice_armed = False
         self.hold_intervals = []
         self.code_arrivals = 0
+        self.order = 0
+        self.preemptions, self.recompute_tokens = [0, 0], [0, 0]
 
     # ---------- event plumbing ----------
     def push(self, time, kind, payload=None):
@@ -148,7 +256,8 @@ class Simulator:
             getattr(self, "on_" + kind)(payload)
         return {"policy": self.policy, "requests": [self.record(request) for request in self.completed],
                 "decisions": self.decisions, "migrations": self.migrations, "population": self.population,
-                "budgets_gib": self.budgets, "hold_intervals": self.hold_intervals}
+                "budgets_gib": self.budgets, "hold_intervals": self.hold_intervals, "kv_mode": self.mode,
+                "preemptions": list(self.preemptions), "recompute_tokens": list(self.recompute_tokens)}
 
     def record(self, request):
         return {"request_id": request.id, "trace_request_id": request.id, "model": request.model,
@@ -156,14 +265,161 @@ class Simulator:
                 "arrival_s": request.arrival,
                 "reserved_at": request.reserved_at, "first_token_at": request.first_token_at,
                 "completed_at": request.completed_at, "rank_initial": request.rank_initial,
-                "moves": request.moves, "admission_path": request.path}
+                "moves": request.moves, "admission_path": request.path, "preemptions": request.preemptions}
 
     # ---------- KV accounting ----------
-    def used_gib(self):
-        return [pages * PAGE_GIB for pages in self.used_pages]
+    def shared_pages(self, tenant):
+        """Conv blocks interleave across pages (page sharing); the Code's big prefill runs own their pages."""
+        return tenant.index == 1 and self.params["page_sharing"]
 
-    def fits(self, request, rank):
-        return (self.used_pages[rank] + request.pages) * PAGE_GIB <= self.budgets[rank] + 1e-9
+    def tenant_pages(self, tenant, rank, blocks=None):
+        if self.page_model:
+            return tenant.pools[rank].pages()
+        blocks = tenant.blocks[rank] if blocks is None else blocks
+        pages = math.ceil(blocks / PAGE_BLOCKS)
+        if self.shared_pages(tenant) and blocks > 0:
+            return max(tenant.high_water[rank], pages)
+        return pages
+
+    def commit_pages(self, tenant, rank):
+        if self.page_model:
+            return
+        tenant.high_water[rank] = self.tenant_pages(tenant, rank) if tenant.blocks[rank] > 0 else 0
+
+    def pages_on(self, rank):
+        if self.mode == "full":
+            return self.used_pages[rank]
+        return 2 + sum(self.tenant_pages(tenant, rank) for tenant in self.tenants)
+
+    def used_gib(self):
+        return [self.pages_on(rank) * PAGE_GIB for rank in range(self.num_ranks)]
+
+    def reservation_blocks(self, request):
+        """Blocks a controlled admission books: the legacy oracle length, or the prompt plus the fixed extra."""
+        if self.mode == "full":
+            return request.blocks
+        return math.ceil((request.prompt + self.params["reserve_extra_tokens"]) / BLOCK_TOKENS)
+
+    def target_blocks(self, request):
+        """Blocks the request needs now: current length (native Code prefill: computed chunks + the next one)."""
+        tokens = request.prompt + request.generated
+        if request.model == 0 and request.start_step is None and self.mode == "native":
+            done = request.prefill_chunks - request.chunks_left
+            tokens = min(request.prompt, (done + 1) * CHUNK_TOKENS)
+        if self.mode == "prompt":
+            tokens = max(tokens, request.prompt + self.params["reserve_extra_tokens"])
+        return math.ceil(tokens / BLOCK_TOKENS)
+
+    def set_blocks(self, tenant, request, blocks):
+        if self.page_model:
+            pool = tenant.pools[request.rank]
+            if blocks < request.held_blocks:
+                pool.release(request)
+                pool.alloc(request, blocks)
+            elif blocks > request.held_blocks:
+                # decode growth of a running request is a one-block allocation (packed into the fullest page)
+                pool.alloc(request, blocks - request.held_blocks,
+                           packed=request.held_blocks > 0 and blocks - request.held_blocks == 1)
+        tenant.blocks[request.rank] += blocks - request.held_blocks
+        request.held_blocks = blocks
+        if tenant.blocks[request.rank] == 0:
+            tenant.high_water[request.rank] = 0
+
+    def extra_pages(self, tenant, rank, blocks):
+        if self.page_model:
+            return math.ceil(max(0, blocks - tenant.pools[rank].slots) / PAGE_BLOCKS)
+        return self.tenant_pages(tenant, rank, tenant.blocks[rank] + blocks) - self.tenant_pages(tenant, rank)
+
+    def fits(self, request, rank, headroom=0.0):
+        if self.mode == "full":
+            return (self.used_pages[rank] + request.pages) * PAGE_GIB <= self.budgets[rank] + 1e-9
+        pages = self.extra_pages(self.tenants[request.model], rank, self.reservation_blocks(request))
+        return (self.pages_on(rank) + pages) * PAGE_GIB + headroom <= self.budgets[rank] + 1e-9
+
+    def grow(self, tenant, request):
+        """Allocate what the current length needs; retract on shortage. False if the request itself was retracted."""
+        need = self.target_blocks(request)
+        if need <= request.held_blocks:
+            return True
+        if self.page_model:
+            # holes in mapped pages are used first; only a new page can hit the GPU limit, and vLLM then preempts
+            # its own newest request on that rank, whose freed blocks become holes for the requester
+            rank = request.rank
+            while self.pages_on(rank) + self.extra_pages(tenant, rank, need - request.held_blocks) \
+                    > self.capacity_pages[rank]:
+                candidates = [item for item in list(tenant.active.values()) + list(tenant.joining.values())
+                              if item.rank == rank]
+                if not candidates:
+                    break
+                victim = max(candidates, key=lambda item: item.order)
+                self.retract(tenant, victim)
+                if victim is request:
+                    return False
+            self.set_blocks(tenant, request, need)
+            return True
+        self.set_blocks(tenant, request, need)
+        ok = self.make_room(tenant, request.rank, request)
+        self.commit_pages(tenant, request.rank)
+        return ok
+
+    def make_room(self, tenant, rank, requester):
+        while self.pages_on(rank) > self.capacity_pages[rank]:
+            candidates = [request for request in list(tenant.active.values()) + list(tenant.joining.values())
+                          if request.rank == rank]
+            if not candidates:
+                return True
+            victim = max(candidates, key=lambda request: request.order)
+            self.retract(tenant, victim)
+            if victim is requester:
+                return False
+        return True
+
+    def retract(self, tenant, request):
+        rank = request.rank
+        self.set_blocks(tenant, request, 0)
+        if request.id in tenant.active:
+            del tenant.active[request.id]
+            tenant.count[rank] -= 1
+            tenant.context[rank] -= request.ctx
+        else:
+            tenant.joining.pop(request.id, None)
+        request.ctx = 0.0
+        request.preemptions += 1
+        self.preemptions[tenant.index] += 1
+        if request.model == 0 and request.start_step is None:
+            done = request.prefill_chunks - request.chunks_left
+            self.recompute_tokens[tenant.index] += min(request.prompt, done * CHUNK_TOKENS)
+            request.chunks_left = request.prefill_chunks
+        else:
+            self.recompute_tokens[tenant.index] += request.prompt + request.generated
+            request.recompute_left = request.prompt + request.generated
+        tenant.waiting[rank].insert(0, request)
+
+    def admit_waiting(self, tenant):
+        """vLLM's own scheduling of its waiting queue: start the head once its current sequence fits (full ISL)."""
+        for rank in range(self.num_ranks):
+            queue = tenant.waiting[rank]
+            while queue:
+                request = queue[0]
+                need = math.ceil((request.prompt + request.generated) / BLOCK_TOKENS)
+                if self.pages_on(rank) + self.extra_pages(tenant, rank, need) > self.capacity_pages[rank]:
+                    break
+                queue.pop(0)
+                self.order += 1
+                request.order = self.order
+                if request.recompute_left > 0:
+                    self.set_blocks(tenant, request, need)
+                else:
+                    if request.model == 0 and request.start_step is None and not request.prefill_chunks:
+                        self.init_code(request)
+                    self.set_blocks(tenant, request, self.target_blocks(request))
+                self.commit_pages(tenant, rank)
+                tenant.joining[request.id] = request
+
+    def kick(self):
+        for tenant in self.tenants:
+            if tenant.has_waiting() and not tenant.busy and not tenant.paused and not tenant.held:
+                self.start_step(tenant)
 
     def observed(self):
         observed = []
@@ -172,16 +428,40 @@ class Simulator:
                       "mapped_bytes": PAGE_BYTES, "page_bytes": PAGE_BYTES, "block_bytes": BLOCK_BYTES,
                       "page_block_capacity": PAGE_BLOCKS, "uniform_page_geometry": True, "block_size": BLOCK_TOKENS,
                       "mapped_free_block_slots": 0, "free_blocks": 10**7} for _ in range(self.num_ranks)]
-            for request in list(tenant.active.values()) + list(tenant.joining.values()):
+            waiting = [request for queue in tenant.waiting for request in queue]
+            for request in list(tenant.active.values()) + list(tenant.joining.values()) + waiting:
                 rank = ranks[request.rank]
-                decoding = request.start_step is not None
-                rank["requests"].append({"id": request.id, "computed_tokens": tenant.current_context(request),
-                                         "prompt_tokens": request.prompt, "output_tokens": tenant.generated(request),
-                                         "max_tokens": request.output, "num_blocks": request.blocks,
-                                         "movable": decoding})
-                rank["pages"].append({"owners": [request.id], "pinned": False,
-                                      "memory_gib": request.pages * PAGE_GIB})
-                rank["mapped_bytes"] += request.pages * PAGE_BYTES
+                decoding = (request.start_step is not None and request.recompute_left == 0
+                            and request.id in tenant.active)
+                if self.mode == "full":
+                    decoding = request.start_step is not None
+                blocks = request.blocks if self.mode == "full" else request.held_blocks
+                rank["requests"].append({"id": request.id, "computed_tokens": request.prompt + request.generated,
+                                         "prompt_tokens": request.prompt, "output_tokens": request.generated,
+                                         "num_blocks": blocks, "movable": decoding})
+                if self.mode == "full":
+                    rank["pages"].append({"owners": [request.id], "pinned": False,
+                                          "memory_gib": request.pages * PAGE_GIB})
+                    rank["mapped_bytes"] += request.pages * PAGE_BYTES
+                elif blocks and not self.shared_pages(tenant) and not self.page_model:
+                    rank["pages"].append({"owners": [request.id], "pinned": False,
+                                          "memory_gib": blocks / PAGE_BLOCKS * PAGE_GIB})
+            if self.mode != "full":
+                for index, rank in enumerate(ranks):
+                    pages = self.tenant_pages(tenant, index)
+                    rank["mapped_bytes"] = (1 + pages) * PAGE_BYTES
+                    rank["mapped_free_block_slots"] = pages * PAGE_BLOCKS - tenant.blocks[index]
+                    # kvcached get_num_free_blocks() = available_size(): this pool's holes plus physically free pages
+                    rank["free_blocks"] = (rank["mapped_free_block_slots"]
+                                           + max(0, self.capacity_pages[index] - self.pages_on(index)) * PAGE_BLOCKS)
+                    if self.page_model:
+                        pool = tenant.pools[index]
+                        rank["pages"].extend({"owners": sorted(pool.owners[page]), "pinned": False,
+                                              "memory_gib": PAGE_GIB} for page in sorted(pool.free))
+                    elif self.shared_pages(tenant) and pages:
+                        owners = sorted(request["id"] for request in rank["requests"] if request["num_blocks"])
+                        rank["pages"].extend({"owners": owners, "pinned": False, "memory_gib": PAGE_GIB}
+                                             for _ in range(pages))
             observed.append(ranks)
         return observed
 
@@ -190,24 +470,70 @@ class Simulator:
                    for model in models for tenant in (self.tenants[model],)
                    for request in list(tenant.active.values()) + list(tenant.joining.values()))
 
+    # ---------- headroom (shared formula with the live runtime) ----------
+    def growth_gib(self, arrival_prompt=None):
+        if self.mode == "full" or self.spec.get("no_headroom"):
+            return 0.0
+        conv = self.tenants[1]
+        counts = [conv.count[rank] + sum(1 for request in conv.joining.values() if request.rank == rank)
+                  for rank in range(self.num_ranks)]
+        tokens = conv_growth_tokens(self.belief, self.planner_params, counts, list(conv.context), arrival_prompt,
+                                    bool(self.spec.get("isolate")), self.spec.get("slice"))
+        return tokens * BLOCK_GIB / BLOCK_TOKENS
+
+    def slack_gib(self):
+        if self.mode == "full" or self.spec.get("no_headroom"):
+            return 0.0
+        return self.planner_params["slack_pages"] * PAGE_GIB
+
+    def conv_on(self, rank):
+        conv = self.tenants[1]
+        return (conv.count[rank] + sum(1 for request in conv.joining.values() if request.rank == rank)
+                + len(conv.waiting[rank]))
+
+    def code_headroom(self, rank, arrival_prompt):
+        if self.mode == "full" or self.spec.get("no_headroom"):
+            return 0.0
+        return self.conv_on(rank) * self.growth_gib(arrival_prompt) + self.slack_gib()
+
     # ---------- arrivals and admission ----------
     def on_arrival(self, request):
-        self.queues[request.model].append(request)
         if request.model == 0:
             self.code_arrivals += 1
+        if self.native:
+            tenant = self.tenants[request.model]
+            order = [(tenant.next_rank + offset) % self.num_ranks for offset in range(self.num_ranks)]
+            joining = [sum(1 for item in tenant.joining.values() if item.rank == rank) for rank in range(self.num_ranks)]
+            rank = min(order, key=lambda r: len(tenant.waiting[r]) * 4 + tenant.count[r] + joining[r])
+            tenant.next_rank = (tenant.next_rank + 1) % self.num_ranks
+            request.rank = request.rank_initial = rank
+            request.reserved_at, request.path = self.now, "native"
+            tenant.waiting[rank].append(request)
+            self.kick()
+            return
+        self.queues[request.model].append(request)
         self.dispatch()
+
+    def init_code(self, request):
+        request.chunks_left = request.prefill_chunks = math.ceil(request.prompt / CHUNK_TOKENS)
+        rng = random.Random(f"{self.params['noise_seed']}:{request.id}")
+        interference, prefill = rng.gauss(1.0, 1.0), rng.gauss(1.0, 1.0)
+        request.factor = max(0.2, 1.0 + self.params["interference_cv"] * (interference - 1.0))
+        request.prefill_factor = max(0.5, 1.0 + self.params["prefill_cv"] * (prefill - 1.0))
 
     def admit(self, request, rank, path):
         request.rank = request.rank_initial = rank
         request.reserved_at, request.path = self.now, path
-        self.used_pages[rank] += request.pages
         tenant = self.tenants[request.model]
+        if self.mode == "full":
+            self.used_pages[rank] += request.pages
+        else:
+            self.order += 1
+            request.order = self.order
+            self.set_blocks(tenant, request, self.reservation_blocks(request))
+            self.commit_pages(tenant, rank)
         if request.model == 0:
-            request.chunks_left = math.ceil(request.prompt / CHUNK_TOKENS)
-            rng = random.Random(f"{self.params['noise_seed']}:{request.id}")
-            interference, prefill = rng.gauss(1.0, 1.0), rng.gauss(1.0, 1.0)
-            request.factor = max(0.2, 1.0 + self.params["interference_cv"] * (interference - 1.0))
-            request.prefill_factor = max(0.5, 1.0 + self.params["prefill_cv"] * (prefill - 1.0))
+            self.init_code(request)
         tenant.joining[request.id] = request
         if self.fairness is not None:
             self.fairness.reserved(request.id, self.now, self.now)
@@ -274,13 +600,15 @@ class Simulator:
                     self.fairness.update(waiting, self.now)
                     if not self.fairness.authorization(request.model, request.id, self.now)["allowed"]:
                         continue
-                candidates = [rank for rank in range(self.num_ranks) if self.fits(request, rank)]
+                candidates = [rank for rank in range(self.num_ranks)
+                              if self.fits(request, rank,
+                                           self.code_headroom(rank, request.prompt) if request.model == 0 else 0.0)]
                 if candidates:
                     counts = self.tenants[request.model].count
                     joining = [0] * self.num_ranks
                     for item in self.tenants[request.model].joining.values():
                         joining[item.rank] += 1
-                    rank = min(candidates, key=lambda r: (counts[r] + joining[r], self.used_pages[r], r))
+                    rank = min(candidates, key=lambda r: (counts[r] + joining[r], self.pages_on(r), r))
                     self.queues[request.model].pop(0)
                     self.admit(request, rank, "direct")
                     progressed = True
@@ -292,22 +620,25 @@ class Simulator:
         if self.now < self.plan_not_before.get(request.id, 0.0):
             return False
         self.plan_not_before[request.id] = self.now + self.params["plan_retry_s"]
+        need = self.reservation_blocks(request) * BLOCK_GIB if self.mode != "full" else request.pages * PAGE_GIB
         free = sum(self.budgets) - sum(self.used_gib())
-        if request.pages * PAGE_GIB < self.planner_params["migrate_min_gib"] or free < request.pages * PAGE_GIB:
+        if need < self.planner_params["migrate_min_gib"] or free < need:
             return False
-        arrival = {"model": request.model, "tokens": request.prompt + request.output,
-                   "prompt_tokens": request.prompt, "output_tokens": request.output}
+        tokens = (request.prompt + request.output if self.mode == "full"
+                  else request.prompt + self.params["reserve_extra_tokens"])
+        arrival = {"model": request.model, "tokens": tokens, "prompt_tokens": request.prompt}
         seed = int.from_bytes(hashlib.sha256(f"{self.params['seed']}:{request.id}".encode()).digest()[:8], "big")
 
         def plan_fn():
-            return plan_admission(build_state(self.observed(), self.budgets), arrival, self.spec["admission"],
-                                  self.belief, self.planner_params, seed)
+            state = build_state(self.observed(), self.budgets, (0.0, self.growth_gib(request.prompt)),
+                                self.slack_gib())
+            return plan_admission(state, arrival, self.spec["admission"], self.belief, self.planner_params, seed)
 
         preplan = plan_fn()
         if preplan.get("target") is None:
             return False
         pause_models = sorted({move["model"] for move in preplan["moves"]})
-        if not self.all_decoding(pause_models):
+        if self.mode == "full" and not self.all_decoding(pause_models):
             return False
         self.start_transaction("admission", plan_fn, request, pause_models)
         return True
@@ -315,7 +646,13 @@ class Simulator:
     # ---------- stepping ----------
     def other_phase(self, tenant):
         other = self.tenants[1 - tenant.index]
-        if not other.has_work() or (other.held and not other.busy):
+        if other.held and not other.busy:
+            return False
+        if not other.has_work():
+            # vLLM DP: a request queued inside the engine (KV-blocked arrival or retracted request) keeps the whole DP
+            # group stepping dummy batches (EP collectives every step), which interferes like a decode (V8 native)
+            if other.has_waiting() and not other.paused and self.params["dp_dummy_interference"]:
+                return "decode"
             return False
         if other.index == 0 and not other.busy and other.sliced:
             return False  # the Code is paused for a Conv slice
@@ -331,6 +668,14 @@ class Simulator:
                    + list(self.tenants[0].joining.values()) if request.chunks_left > 0]
         return sum(factors) / len(factors) if factors else 1.0
 
+    def recompute_s(self, tenant):
+        """Extra step time for retracted requests re-prefilling one chunk per rank (DP ranks step together)."""
+        chunks = [0] * self.num_ranks
+        for request in tenant.in_step:
+            if request.recompute_left > 0:
+                chunks[request.rank] = max(chunks[request.rank], min(CHUNK_TOKENS, request.recompute_left))
+        return max(chunks) * self.params["recompute_s_per_token"]
+
     def step_duration(self, tenant):
         phase = self.other_phase(tenant)
         if tenant.index == 0 and any(request.chunks_left > 0 for request in tenant.in_step):
@@ -345,10 +690,12 @@ class Simulator:
                     value = value[str(chosen)] if str(chosen) in value else value[chosen]
                 per_100k = value * self.prefill_factor("prefill_factor")
             return per_100k * prompt / 100000 / math.ceil(prompt / CHUNK_TOKENS)
+        extra = self.recompute_s(tenant) if self.mode != "full" else 0.0
         if tenant.index == 1 and phase == "prefill":
             own = self.truth.decode_step(1, tenant.count, tenant.context, False)
-            return own + self.prefill_factor() * (self.truth.decode_step(1, tenant.count, tenant.context, phase) - own)
-        return self.truth.decode_step(tenant.index, tenant.count, tenant.context, phase)
+            return own + self.prefill_factor() * (self.truth.decode_step(1, tenant.count, tenant.context, phase)
+                                                  - own) + extra
+        return self.truth.decode_step(tenant.index, tenant.count, tenant.context, phase) + extra
 
     def slice_due(self, slice_cfg):
         """Periodic slices: (S, R). TTFT-triggered: (T_wait, R, S_max) -- slice when a held Conv request has not
@@ -360,7 +707,11 @@ class Simulator:
         return held_for >= slice_cfg[2] or (waiting and max(waiting) >= slice_cfg[0])
 
     def start_step(self, tenant):
-        if tenant.busy or tenant.paused or tenant.held or not tenant.has_work():
+        if tenant.busy or tenant.paused or tenant.held:
+            return
+        if tenant.has_waiting():
+            self.admit_waiting(tenant)
+        if not tenant.has_work():
             return
         if tenant.index == 0 and self.spec.get("hold_first") and self.tenants[1].hold_pending:
             return  # Code waits until Conv reached its pause boundary
@@ -383,7 +734,13 @@ class Simulator:
         for request in tenant.joining.values():
             tenant.active[request.id] = request
             tenant.count[request.rank] += 1
-            tenant.context[request.rank] += request.prompt if request.model == 1 else 0
+            if request.model == 1:
+                request.ctx = request.prompt + request.generated
+            elif request.start_step is not None:
+                request.ctx = request.prompt + request.generated
+            else:
+                request.ctx = 0.0
+            tenant.context[request.rank] += request.ctx
         tenant.joining.clear()
         tenant.in_step = list(tenant.active.values())
         tenant.busy = True
@@ -394,9 +751,15 @@ class Simulator:
         tenant.busy = False
         tenant.step_index += 1
         step = tenant.step_index
-        prefilled_ranks = set()
+        prefilled_ranks, recomputed_ranks, finished = set(), set(), []
         for request in tenant.in_step:
             if request.id not in tenant.active:
+                continue
+            if request.recompute_left > 0:
+                if request.rank in recomputed_ranks:
+                    continue
+                recomputed_ranks.add(request.rank)
+                request.recompute_left = max(0, request.recompute_left - CHUNK_TOKENS)
                 continue
             if request.start_step is None:
                 if request.chunks_left > 0:
@@ -405,16 +768,23 @@ class Simulator:
                     prefilled_ranks.add(request.rank)
                     request.chunks_left -= 1
                     if request.chunks_left:
+                        if self.mode == "native":
+                            self.grow(tenant, request)  # the next chunk's blocks
                         continue
                     tenant.context[request.rank] += request.prompt
+                    request.ctx += request.prompt
                 request.start_step = step
-                request.first_token_at = self.now
-                heapq.heappush(tenant.completions, (step + request.output - 1, request.id))
+                if request.first_token_at is None:
+                    request.first_token_at = self.now
+            request.generated += 1
             tenant.context[request.rank] += 1
-        while tenant.completions and tenant.completions[0][0] <= step:
-            _, identifier = heapq.heappop(tenant.completions)
-            request = tenant.active.get(identifier)
-            if request is not None and request.start_step is not None:
+            request.ctx += 1
+            if self.mode != "full" and not self.grow(tenant, request):
+                continue
+            if request.generated >= request.output:
+                finished.append(request)
+        for request in sorted(finished, key=lambda item: item.id):
+            if request.id in tenant.active:
                 self.complete(tenant, request)
         if tenant.pause_pending and (step % self.params["pause_boundary"] == 0 or not tenant.has_work()):
             self.pause_reached(tenant)
@@ -430,8 +800,11 @@ class Simulator:
     def complete(self, tenant, request):
         del tenant.active[request.id]
         tenant.count[request.rank] -= 1
-        tenant.context[request.rank] -= request.prompt + request.output
-        self.used_pages[request.rank] -= request.pages
+        tenant.context[request.rank] -= request.ctx
+        if self.mode == "full":
+            self.used_pages[request.rank] -= request.pages
+        else:
+            self.set_blocks(tenant, request, 0)
         request.completed_at = self.now
         self.completed.append(request)
         if self.spec.get("isolate") and request.model == 0 and not tenant.has_work():
@@ -439,6 +812,7 @@ class Simulator:
         if self.spec["return"] and request.model == 0:
             self.push(self.now + 0.5, "return_check", "release")
         self.dispatch()
+        self.kick()
 
     # ---------- transactions ----------
     def start_transaction(self, kind, plan_fn, arrival=None, pause_models=(0, 1)):
@@ -489,14 +863,24 @@ class Simulator:
             request = tenant.active.get(move["id"]) or tenant.joining.get(move["id"])
             if request is None or request.rank != move["source"]:
                 continue
-            context = tenant.current_context(request)
             if request.id in tenant.active:
                 tenant.count[move["source"]] -= 1
-                tenant.context[move["source"]] -= context
+                tenant.context[move["source"]] -= request.ctx
                 tenant.count[move["destination"]] += 1
-                tenant.context[move["destination"]] += context
-            self.used_pages[move["source"]] -= request.pages
-            self.used_pages[move["destination"]] += request.pages
+                tenant.context[move["destination"]] += request.ctx
+            if self.mode == "full":
+                self.used_pages[move["source"]] -= request.pages
+                self.used_pages[move["destination"]] += request.pages
+            else:
+                if self.page_model:
+                    # the destination prepares all blocks in one run; the source frees them after commit
+                    tenant.pools[move["source"]].release(request)
+                    tenant.pools[move["destination"]].alloc(request, request.held_blocks)
+                tenant.blocks[move["source"]] -= request.held_blocks
+                if tenant.blocks[move["source"]] == 0:
+                    tenant.high_water[move["source"]] = 0
+                tenant.blocks[move["destination"]] += request.held_blocks
+                self.commit_pages(tenant, move["destination"])
             request.rank = move["destination"]
             request.moves += 1
             self.migrations.append({"request_id": request.id, "model": move["model"], "source": move["source"],
@@ -505,7 +889,9 @@ class Simulator:
                                * (self.now - self.tenants[index].paused_at) for index in transaction["order"])
         admitted = False
         arrival = transaction["arrival"]
-        if arrival is not None and plan.get("target") is not None and self.fits(arrival, plan["target"]):
+        if arrival is not None and plan.get("target") is not None and self.fits(
+                arrival, plan["target"], self.code_headroom(plan["target"], arrival.prompt) if arrival.model == 0
+                else 0.0):
             self.queues[arrival.model].remove(arrival)
             self.admit(arrival, plan["target"], "migration")
             admitted = True
@@ -519,29 +905,35 @@ class Simulator:
             tenant.paused = False
             self.start_step(tenant)
         self.dispatch()
+        self.kick()
 
     # ---------- periodic work ----------
     def on_return_check(self, reason):
         if reason != "release":
             self.push(self.now + self.params["return_period_s"], "return_check")
         if (self.transaction is not None or any(self.queues)
-                or self.now - self.last_return < self.params["return_cooldown_s"] or not self.all_decoding((1,))):
+                or self.now - self.last_return < self.params["return_cooldown_s"]
+                or (self.mode == "full" and not self.all_decoding((1,)))):
             return
+        if self.mode != "full" and (self.tenants[0].has_work() or self.tenants[0].has_waiting()):
+            return  # no rebalancing while a Code is resident: its prefill slows peer copies and the gain is nil
         counts = self.tenants[1].count
         if max(counts) - min(counts) < 2:
             return
         rate = (self.code_arrivals + 1) / (max(1.0, self.now) + 1 / self.planner_params["code_rate"])
 
         def plan_fn():
-            return plan_return(build_state(self.observed(), self.budgets), self.belief,
-                               dict(self.planner_params, code_rate=rate))
+            state = build_state(self.observed(), self.budgets, (0.0, self.growth_gib()), self.slack_gib())
+            return plan_return(state, self.belief, dict(self.planner_params, code_rate=rate))
 
         if plan_fn()["moves"]:
             self.start_transaction("return", plan_fn, pause_models=(1,))
 
     def on_population(self, _):
         self.population.append({"t": self.now, "counts": [list(tenant.count) for tenant in self.tenants],
-                                "used_gib": self.used_gib(), "queued": [len(queue) for queue in self.queues]})
+                                "used_gib": self.used_gib(), "queued": [len(queue) for queue in self.queues],
+                                "waiting": [[len(queue) for queue in tenant.waiting] for tenant in self.tenants],
+                                "preemptions": list(self.preemptions)})
         self.push(self.now + self.params["population_period_s"], "population")
 
 

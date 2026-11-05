@@ -26,8 +26,7 @@ def rank_observation(rank, requests, start_page=0):
             page_id += 1
         records.append({"id": request["id"], "computed_tokens": request["context"],
                         "prompt_tokens": request.get("prompt", 85), "output_tokens": request["context"] - 85,
-                        "max_tokens": request["tokens"] - request.get("prompt", 85), "blocks": block_ids,
-                        "movable": True})
+                        "blocks": block_ids, "movable": True})
     pages.append({"id": page_id, "owners": [], "pinned": True, "memory_gib": PAGE_BLOCKS * BLOCK_BYTES / 1024**3})
     return {"rank": rank, "requests": records, "pages": pages,
             "mapped_bytes": len(pages) * PAGE_BLOCKS * BLOCK_BYTES, "page_bytes": PAGE_BLOCKS * BLOCK_BYTES,
@@ -45,7 +44,7 @@ def make_observed(conv_per_rank, contexts=None, num_ranks=4):
     return observed
 
 
-CODE = {"model": 0, "tokens": 101626 + 64, "prompt_tokens": 101626, "output_tokens": 64}
+CODE = {"model": 0, "tokens": 101626 + 64, "prompt_tokens": 101626}
 
 
 def test_capture_bucket():
@@ -105,7 +104,6 @@ def test_return_moves_back_to_vacated_rank_when_worth_it():
     observed = make_observed([2, 18, 18, 18], contexts={(rank, index): 6000 for rank in range(4) for index in range(20)})
     for rank in range(1, 4):
         for request in observed[1][rank]["requests"]:
-            request["max_tokens"] = 12000
             request["output_tokens"] = 4000
     state = build_state(observed, [40.0] * 4)
     model = StepModel(default_dp2_params())
@@ -119,3 +117,89 @@ def test_return_rejects_when_balanced():
     state = build_state(observed, [40.0] * 4)
     plan = plan_return(state, StepModel(default_dp2_params()), DEFAULT_PARAMS)
     assert not plan["accepted"] and not plan["moves"]
+
+
+def test_planner_never_reads_output_length():
+    """Online the final output length is unknown: plans must not change when a (replay-only) length is attached."""
+    observed = make_observed([6, 6, 6, 6])
+    with_length = make_observed([6, 6, 6, 6])
+    for ranks in with_length:
+        for rank in ranks:
+            for request in rank["requests"]:
+                request["max_tokens"] = 50
+    model = StepModel(default_dp2_params())
+    for policy in ("mig_random", "ca"):
+        plain = plan_admission(build_state(observed, [10.0] * 4), CODE, policy, model, DEFAULT_PARAMS, seed=3)
+        leaked = plan_admission(build_state(with_length, [10.0] * 4), CODE, policy, model, DEFAULT_PARAMS, seed=3)
+        assert (plain["target"], plain["moves"]) == (leaked["target"], leaked["moves"])
+
+
+def test_growth_headroom_keeps_room_on_target_and_destinations():
+    observed = make_observed([6, 6, 6, 6])
+    budgets = [12.0] * 4
+    model = StepModel(default_dp2_params())
+    loose = build_state(observed, budgets)
+    plan = plan_admission(loose, CODE, "ca", model, DEFAULT_PARAMS)
+    tight = build_state(observed, budgets, growth_gib=(0.0, 0.2), slack_gib=0.1)
+    guarded = plan_admission(tight, CODE, "ca", model, DEFAULT_PARAMS)
+    assert plan["target"] is not None and guarded["target"] is not None
+    assert len(guarded["moves"]) > len(plan["moves"])
+    used = plan_usage(tight, guarded["moves"], CODE, guarded["target"])
+    destination = {move["id"]: move["destination"] for move in guarded["moves"]}
+    counts = [0] * 4
+    for request in tight["requests"]:
+        if request["model"] == 1:
+            counts[destination.get(request["id"], request["rank"])] += 1
+    for rank in {guarded["target"], *destination.values()}:
+        assert used[rank] + counts[rank] * 0.2 + 0.1 <= budgets[rank] + 1e-6
+
+
+def test_headroom_rejects_a_rank_that_only_fits_without_growth():
+    observed = make_observed([4, 9, 9, 9])
+    state = build_state(observed, [14.5] * 4)
+    assert plan_usage(state, [], CODE, 0) is not None
+    grown = build_state(observed, [14.5] * 4, growth_gib=(0.0, 0.3), slack_gib=0.0)
+    assert plan_usage(grown, [], CODE, 0) is None
+
+
+def test_conv_growth_tokens_uses_rates_not_lengths():
+    from planner import conv_growth_tokens
+
+    params = dict(DEFAULT_PARAMS)
+    model = StepModel(default_dp2_params())
+    counts, contexts = [8, 8, 8, 8], [8 * 6000.0] * 4
+    relief = conv_growth_tokens(model, params, counts, contexts)
+    assert math.isclose(relief, params["relief_horizon_s"] / model.decode_step(1, counts, contexts))
+    held = conv_growth_tokens(model, params, counts, contexts, arrival_prompt=100000, isolate=True)
+    sliced = conv_growth_tokens(model, params, counts, contexts, 100000, True, (2.0, 1.0, 15.0))
+    corun = conv_growth_tokens(model, params, counts, contexts, 100000, False)
+    assert held == relief and sliced >= relief and corun >= relief
+
+
+def test_arrival_counts_pages_released_by_its_moves_toward_free_blocks():
+    """kvcached free_blocks is physical (holes + free pages): when the target is full, the arrival only fits once the
+    moves release pages, so the free-block check must credit them (V8/V9c live: never-feasible plans)."""
+    observed = make_observed([6, 6, 6, 6])
+    for index in range(4):
+        used = sum(page["memory_gib"] for model in (0, 1) for page in observed[model][index]["pages"])
+        for model in (0, 1):  # both tenants map the same physical memory: 12 GiB per GPU
+            observed[model][index]["free_blocks"] = int(max(0.0, 12.0 - used) * 1024**3 // BLOCK_BYTES)
+    model = StepModel(default_dp2_params())
+    state = build_state(observed, [12.0] * 4)
+    blocks = math.ceil(CODE["tokens"] / 16)
+    assert all(blocks > state["pools"][(0, rank)]["free_blocks"] for rank in range(4))
+    assert all(plan_usage(state, [], CODE, rank) is None for rank in range(4))
+    plan = plan_admission(state, CODE, "ca", model, DEFAULT_PARAMS)
+    assert plan["target"] is not None and plan["moves"], plan
+    assert plan_usage(state, plan["moves"], CODE, plan["target"]) is not None
+
+
+def test_infeasible_plan_reports_per_target_diagnostics():
+    observed = make_observed([6, 6, 6, 6])
+    state = build_state(observed, [9.0] * 4)  # the Code (9.3 GiB) can never fit
+    plan = plan_admission(state, CODE, "ca", StepModel(default_dp2_params()), DEFAULT_PARAMS)
+    assert plan["target"] is None and plan["reason"] == "no_feasible_plan"
+    assert [item["target"] for item in plan["diagnostics"]] == [0, 1, 2, 3]
+    for item in plan["diagnostics"]:
+        assert item["movable"] == 6 and item["need_blocks"] == math.ceil(CODE["tokens"] / 16)
+        assert set(item["stages"]) <= {"select", "assign", "usage"} and item["released_if_all_moved_gib"] > 0

@@ -72,4 +72,7 @@ args=(--checkpoint "$checkpoint" --output "$out" --prompt-bank "$work/inputs/pro
 [[ -n "${XPLACE_PLANNER_PARAMS:-}" ]] && args+=(--planner-params "$work/inputs/$XPLACE_PLANNER_PARAMS")
 [[ -n "${XPLACE_BUDGET_CAP_GIB:-}" ]] && args+=(--budget-cap-gib "$XPLACE_BUDGET_CAP_GIB")
 [[ -n "${XPLACE_PROBE_MAX_MS:-}" ]] && args+=(--probe-max-ms "$XPLACE_PROBE_MAX_MS")
+[[ -n "${XPLACE_KV_MODE:-}" ]] && args+=(--kv-mode "$XPLACE_KV_MODE")
+[[ -n "${XPLACE_RESERVE_EXTRA_TOKENS:-}" ]] && args+=(--reserve-extra-tokens "$XPLACE_RESERVE_EXTRA_TOKENS")
+[[ -n "${XPLACE_SEGMENTS:-}" ]] && args+=(--segments "$work/inputs/$XPLACE_SEGMENTS")
 python "$work/runtime/main.py" "${args[@]}" > "$work/main.log" 2>&1

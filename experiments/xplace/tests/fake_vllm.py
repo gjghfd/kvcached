@@ -7,6 +7,14 @@ import types
 
 PAGE_BLOCKS, BLOCK_TOKENS = 64, 16
 BLOCK_BYTES, PAGE_BYTES = int(1.5 * 1024**2), 96 * 1024**2
+FREE_BYTES, TOTAL_MIB = 40 * 1024**3, 81920
+
+
+def link_gpu(tenants):
+    """Make tenants share one memory ledger per rank, like two engines co-located on the same GPUs."""
+    shared = {"ballast": {}, "tenants": list(tenants)}
+    for tenant in tenants:
+        tenant.gpu = shared
 
 
 def install_fake_vllm():
@@ -23,18 +31,28 @@ def install_fake_vllm():
 
 
 class FakeRequest:
+    sequence = 0
+
     def __init__(self, request_id, prompt, max_tokens, rank, chunk_tokens=None):
         self.id, self.prompt, self.max_tokens, self.rank = request_id, len(prompt), max_tokens, rank
         self.generated, self.prefilled, self.reserved_at = 0, False, time.monotonic()
         # chunked prefill: one step per chunk before the first token (only when chunk_tokens is set)
         self.prefill_left = math.ceil(self.prompt / chunk_tokens) - 1 if chunk_tokens else 0
-        self.blocks = list(range(1, math.ceil((self.prompt + max_tokens) / BLOCK_TOKENS) + 1))
+        self.retracted, self.preemptions = False, 0
+        FakeRequest.sequence += 1
+        self.order = FakeRequest.sequence
         self.done = asyncio.Event()
         self.queue = asyncio.Queue()
 
 
 class FakeTenant:
-    """All DP ranks of one tenant; advances every request by one token per step unless paused."""
+    """All DP ranks of one tenant; advances every request by one token per step unless paused.
+
+    KV follows the admission mode: "full" holds prompt + max_tokens from admission (legacy oracle reservation),
+    "prompt" holds max(prompt + extra, current length), "native" the current length. Outside "full", a step whose
+    growth exceeds the rank's capacity (shared with the linked tenant, minus ballast) retracts the newest request on
+    that rank: its KV is freed and it resumes, output kept, once its current length fits again (vLLM recompute).
+    """
 
     def __init__(self, index, num_ranks, step_s=0.002, chunk_tokens=None):
         self.index, self.num_ranks, self.step_s = index, num_ranks, step_s
@@ -49,10 +67,36 @@ class FakeTenant:
         self.peer = None
         self.overlap_steps = 0
         self.paused_ranks = set()
+        self.mode, self.reserve_extra = "full", 0
+        self.preemptions_total = self.recompute_tokens_total = 0
+        self.next_rank = 0
+        self.ballast_held = {}
+        self.gpu = {"ballast": {}, "tenants": [self]}
 
     def ensure_loop(self):
         if self.loop_task is None or self.loop_task.done():
             self.loop_task = asyncio.get_running_loop().create_task(self.run())
+
+    def capacity_bytes(self, rank):
+        return FREE_BYTES - self.gpu["ballast"].get(rank, 0)
+
+    def tenant_mapped_bytes(self, rank):
+        return (1 + sum(self.pages_of(request) for request in self.rank_requests(rank))) * PAGE_BYTES
+
+    def rank_mapped_bytes(self, rank):
+        return sum(tenant.tenant_mapped_bytes(rank) for tenant in self.gpu["tenants"])
+
+    def retract_for(self, rank):
+        """Free KV on `rank` until it fits, newest request first (vLLM FCFS preemption)."""
+        while self.rank_mapped_bytes(rank) > self.capacity_bytes(rank):
+            live = [request for request in self.rank_requests(rank) if not request.retracted]
+            if not live:
+                return
+            victim = max(live, key=lambda request: request.order)
+            victim.retracted = True
+            victim.preemptions += 1
+            self.preemptions_total += 1
+            self.recompute_tokens_total += victim.prompt + victim.generated
 
     async def run(self):
         while self.requests:
@@ -61,28 +105,52 @@ class FakeTenant:
                 continue
             if self.peer is not None and self.peer.requests and not self.peer.paused:
                 self.overlap_steps += 1
-            for request in list(self.requests.values()):
+            for request in sorted(self.requests.values(), key=lambda item: item.order):
+                if request.retracted:
+                    request.retracted = False
+                    if self.rank_mapped_bytes(request.rank) > self.capacity_bytes(request.rank):
+                        request.retracted = True
+                    else:
+                        request.prefill_left = max(request.prefill_left, 1)  # recompute before decoding again
+                    continue
                 if request.prefill_left > 0:
                     request.prefill_left -= 1
                     continue
                 if not request.prefilled:
                     request.prefilled = True
+                pages = self.pages_of(request)
                 request.generated += 1
+                if self.mode != "full" and self.pages_of(request) > pages:
+                    self.retract_for(request.rank)
+                    if request.retracted:
+                        request.generated -= 1
+                        continue
                 request.queue.put_nowait(request.generated)
                 if request.generated >= request.max_tokens:
                     del self.requests[request.id]
                     request.done.set()
 
     async def generate(self, prompt, sampling_params, request_id, data_parallel_rank=None):
+        if data_parallel_rank is None:
+            # stock DP load balancing: least-loaded engine, scan start rotates so ties spread
+            order = [(self.next_rank + offset) % self.num_ranks for offset in range(self.num_ranks)]
+            data_parallel_rank = min(order, key=lambda rank: len(self.rank_requests(rank)))
+            self.next_rank = (self.next_rank + 1) % self.num_ranks
+        self.engine_core.reqs_in_flight[request_id] = data_parallel_rank
         request = FakeRequest(request_id, prompt["prompt_token_ids"], sampling_params.max_tokens, data_parallel_rank,
                               self.chunk_tokens)
         self.requests[request_id] = request
         self.ensure_loop()
-        while True:
-            count = await request.queue.get()
-            yield types.SimpleNamespace(outputs=[types.SimpleNamespace(token_ids=list(range(count)))])
-            if count >= request.max_tokens:
-                return
+        try:
+            while True:
+                count = await request.queue.get()
+                yield types.SimpleNamespace(outputs=[types.SimpleNamespace(token_ids=list(range(count)))])
+                if count >= request.max_tokens:
+                    return
+        finally:
+            # vLLM AsyncLLM.generate aborts the request when the caller cancels or closes the stream
+            if self.requests.get(request_id) is request:
+                del self.requests[request_id]
 
     def shutdown(self):
         if self.loop_task is not None:
@@ -92,23 +160,52 @@ class FakeTenant:
     def rank_requests(self, rank):
         return [request for request in self.requests.values() if request.rank == rank]
 
+    def num_blocks(self, request):
+        if request.retracted:
+            return 0
+        if self.mode == "full":
+            tokens = request.prompt + request.max_tokens
+        elif self.mode == "prompt":
+            tokens = max(request.prompt + self.reserve_extra, request.prompt + request.generated)
+        else:
+            tokens = request.prompt + request.generated
+        return math.ceil(tokens / BLOCK_TOKENS)
+
+    def blocks_of(self, request):
+        return list(range(1, self.num_blocks(request) + 1))
+
     def pages_of(self, request):
-        return math.ceil(len(request.blocks) / PAGE_BLOCKS)
+        return math.ceil(self.num_blocks(request) / PAGE_BLOCKS)
 
     def geometry(self, rank, requests):
+        # kvcached get_num_free_blocks() is physical: free memory on the GPU (shared by both tenants) in blocks
+        free = max(0, self.capacity_bytes(rank) - self.rank_mapped_bytes(rank)) // BLOCK_BYTES
         return {"rank": rank, "observed_at": time.monotonic(),
                 "mapped_bytes": (1 + sum(self.pages_of(request) for request in requests)) * PAGE_BYTES,
                 "page_bytes": PAGE_BYTES, "block_bytes": BLOCK_BYTES, "page_block_capacity": PAGE_BLOCKS,
                 "uniform_page_geometry": True, "block_size": BLOCK_TOKENS, "mapped_free_block_slots": 0,
-                "free_blocks": 10**6}
+                "free_blocks": int(free)}
+
+    def reservation_tokens(self, request):
+        return request.prompt + (request.max_tokens if self.mode == "full" else self.reserve_extra)
 
     def placement_summary(self, rank):
         requests = self.rank_requests(rank)
-        return {**self.geometry(rank, requests), "requests": [
+        return {**self.geometry(rank, requests), "mode": self.mode, "preemptions_total": self.preemptions_total,
+                "recompute_tokens_total": self.recompute_tokens_total,
+                "requests": [
             {"id": request.id, "computed_tokens": request.prompt + request.generated,
-             "prompt_tokens": request.prompt, "output_tokens": request.generated, "max_tokens": request.max_tokens,
-             "decoding": request.generated > 0, "reserved_at": request.reserved_at, "reservation_pending": False}
+             "prompt_tokens": request.prompt, "output_tokens": request.generated,
+             "decoding": request.generated > 0 and not request.retracted, "reserved_at": request.reserved_at,
+             "reservation_pending": False, "reservation_tokens": self.reservation_tokens(request),
+             "preemptions": request.preemptions}
             for request in requests]}
+
+    def placement_set_mode(self, rank, mode, reserve_extra=0):
+        if self.rank_requests(rank):
+            raise RuntimeError("Switch admission mode only on an idle scheduler")
+        self.mode, self.reserve_extra = mode, int(reserve_extra)
+        return {"mode": self.mode, "preemptions_total": self.preemptions_total}
 
     def placement_snapshot(self, rank, refresh=False):
         requests = self.rank_requests(rank)
@@ -120,9 +217,10 @@ class FakeTenant:
                 page_id += 1
         return {**self.geometry(rank, requests), "pages": pages, "requests": [
             {"id": request.id, "computed_tokens": request.prompt + request.generated,
-             "prompt_tokens": request.prompt, "output_tokens": request.generated, "max_tokens": request.max_tokens,
-             "blocks": list(request.blocks), "movable": request.generated > 0, "reserved_at": request.reserved_at,
-             "reservation_pending": False} for request in requests]}
+             "prompt_tokens": request.prompt, "output_tokens": request.generated,
+             "blocks": self.blocks_of(request), "movable": request.generated > 0 and not request.retracted,
+             "reserved_at": request.reserved_at, "reservation_pending": False,
+             "reservation_tokens": self.reservation_tokens(request)} for request in requests]}
 
     def placement_pause_boundary(self, rank):
         if rank in self.paused_ranks:
@@ -135,8 +233,6 @@ class FakeTenant:
     def placement_begin(self, rank, transaction):
         if not self.paused:
             raise RuntimeError("begin requires pause")
-        if any(request.generated == 0 for request in self.rank_requests(rank)):
-            raise ValueError("Controlled experiment requires an all-decode movable population")
         self.transaction = transaction
         return self.placement_snapshot(rank)
 
@@ -153,8 +249,9 @@ class FakeTenant:
     def placement_export(self, rank, transaction, request_id):
         self.require(transaction)
         request = self.requests[request_id]
-        assert request.rank == rank and request.generated > 0
-        return {"request_id": request_id, "request": request_id, "blocks": list(request.blocks)}
+        if request.rank != rank or request.generated <= 0 or request.retracted:
+            raise ValueError("Request is not migration eligible")
+        return {"request_id": request_id, "request": request_id, "blocks": self.blocks_of(request)}
 
     def placement_prepare(self, rank, transaction, payload):
         self.require(transaction)
@@ -194,9 +291,22 @@ class FakeTenant:
     def placement_retry_reservation(self, rank, request_id):
         return {"reservation_pending": False, "reserved_at": time.monotonic()}
 
+    def free_bytes(self, rank):
+        return self.capacity_bytes(rank) - self.rank_mapped_bytes(rank)
+
     def collective_rpc(self, rank, method, timeout, args, kwargs):
+        if method == "placement_ballast":
+            self.ballast_held[rank] = self.ballast_held.get(rank, 0) + int(args[0])
+            self.gpu["ballast"][rank] = self.gpu["ballast"].get(rank, 0) + int(args[0])
+            return [{"held_bytes": self.ballast_held[rank], "free_mib": self.free_bytes(rank) / 1024**2,
+                     "total_mib": TOTAL_MIB}]
+        if method == "placement_ballast_release":
+            released = self.ballast_held.pop(rank, 0)
+            self.gpu["ballast"][rank] = self.gpu["ballast"].get(rank, 0) - released
+            return [{"released_bytes": released, "free_mib": self.free_bytes(rank) / 1024**2,
+                     "total_mib": TOTAL_MIB}]
         assert method == "placement_memory_snapshot"
-        return [{"free_mib": 40 * 1024, "total_mib": 81920}]
+        return [{"free_mib": self.free_bytes(rank) / 1024**2, "total_mib": TOTAL_MIB}]
 
 
 class FakeEngineCore:

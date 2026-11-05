@@ -386,3 +386,540 @@
 - **证据**：V6 看门狗捕获的 5 次卡顿（0.6–1.1s），调用栈都在 `monitor()` 中同步写 `progress.json` 的 `open()` / `replace()`。输出在共享文件系统上，元数据延迟偶发尖峰，之前在 V2、V4 看到的 3.3/3.6s 很可能也是同一原因。
 - **修复**：`Journal` 改为后台写线程（队列），jsonl 行与 progress 快照都在线程里落盘；trial 结束时 `close()` 等队列写完。写入错误记入 summary 的 `journal_errors`，不中断 trial。
 - **验证**：本地模拟每次写盘阻塞 0.8s，事件循环最大滞后为 0.0017s，所有测试通过。真机验证可以放进下一个打包作业。
+
+## 13. kvcached 原生基线 V7（11-04 用户要求）
+
+### 13.1 依据
+
+- 用户要求加一个"kvcached 方式"的基线：两个 vLLM 同时推理，不加任何协调。
+- 现有基线（`no_move*`）都经过控制器，与原生部署有三处不同：
+  - 控制器按 P+O 全量预留后才准入，放不下就在控制器里排队；原生 vLLM 按步分配 KV，只要当前 chunk 放得下就运行，显存不够时抢占并重算；
+  - 控制器按请求数路由；原生按 `waiting × 4 + running` 选 DP rank，不看显存；
+  - 16 GiB 上限由控制器的准入实现；原生 kvcached 从 GPU 实际剩余显存中按需映射页，保留 `1 − KVCACHED_GPU_UTILIZATION`（作业中为 2%）的余量。
+- V6 日志估计：在 4 个 Code 到达时刻，按 Conv **实际** KV 计算，Code 所在 rank 放得下的比例为 4/4、4/4、4/4、2–4/4；按 **P+O 全量预留** 计算为 4/4、1–2/4、0/4、0–1/4。
+- 推论：原生方式不迁移也可能让 Code 到达即进入，迁移的 A 收益主要是相对全量预留而言；原生的代价可能体现为抢占和重算。
+
+### 13.2 设计
+
+- **新策略 `kvcached_native`**：
+  - 请求到达即交给 vLLM（`data_parallel_rank=None`），控制器不准入、不排队、不迁移、不暂停；
+  - 调度器切到原生准入（`placement_set_native`）：不做 P+O 预留，抢占为 vLLM 原生的 recompute；trial 结束后切回；
+  - 同样的容量：trial 前在每张卡上占掉多余显存（两个 tenant 的 worker 各一半），使 kvcached 可映射的 KV（已映射 + 剩余 − 2% 总显存）为 85.5 个 192 MiB 页组，取整后 85 组，即 15.94 GiB，与受控预算下观测到的单卡最大映射相同；trial 后释放并核对容量恢复；
+  - 原生请求的 `reserved_at` 记为交给 vLLM 的时刻，vLLM 内部的排队和抢占都计入 prefill 区间和 TTFT；
+  - 记录每个请求的抢占次数、每个 tenant 的抢占总数、每卡最大映射、每 60s 的可映射容量；rank 从快照反查。
+- **测试**：新增 3 个（原生提交与 rank 反查、占位精度与释放、`run_phases` 中占位包住原生轮），共 27 个通过。
+- **作业 V7**：tag `v7-native-20261104`，seed 704 的 850s trace，4 轮同机配对，按此顺序：`ca_full_tm_slo`, `kvcached_native`, `ca_full_v2`, `no_move_v2`。`--time 2:00:00`，探针 16.5ms。
+  - 原生轮放第二：让 100K 的 Code prefill 先在受控轮里跑过一次，分配器缓存到位后，原生轮只靠 2% 的余量容纳激活；
+  - 本作业同时是 v3.2（后台写 progress）第一次上真机。
+
+### 13.3 预测（提交前写定）
+
+依据是 V6 中最接近的对照，即 Code 到达即进入、与 Conv 并行的 `mig_random_v2`（57.9s / 32.1ms），加上 13.1 的日志估计：
+
+| 策略 | Code TTFT | Conv TPOT |
+|---|---|---|
+| `kvcached_native` | 55–70s | 31–36ms |
+| `ca_full_tm_slo` | 约 28s | 约 23.6ms |
+| `ca_full_v2` | 约 61s | 约 34ms |
+| `no_move_v2` | 约 111s | 约 29.7ms |
+
+- 抢占：Conv 0–20 次，集中在 660/840s 的 Code 附近；Code 被分到放不下的 rank 时可能自我抢占。
+- **判定**：
+  1. 本系统对 kvcached 原生部署，`kvcached_native` → `ca_full_tm_slo`：Code TTFT 降 ≥40%，Conv TPOT 降 ≥15%；
+  2. 迁移对原生准入，`kvcached_native` → `ca_full_v2`：若 Code TTFT 差异在 ±15% 内，则迁移相对原生准入没有 A 收益，A 只相对全量预留成立，如实报告；
+  3. 全量预留的代价，`no_move_v2` → `kvcached_native`：Code TTFT 降 30–50%，Conv TPOT 高 5–20%；
+  4. 正确性：输出长度精确，抢占不改变输出长度；原生轮的容量记录全程不超过 85 个页组。
+
+### 13.4 执行记录
+
+- **页组大小更正**：§13.2 把页组写成 192 MiB。实际是 96 MiB：每页 2 MiB × 48 层，K、V 在同一个 buffer 内。占位目标为 170.5 个页组（15.984 GiB），实测四卡容量为 16.006/16.006/16.008/15.984 GiB，取整后都是 170 个页组，即 15.94 GiB。共享容量与 §13.2 一致，只是描述有误。
+- **节点**：d1n41a18g02，探针 12.8ms，自然容量 35.6–38.3 GiB/卡。
+- **判定结果**（V7 = 288709，结果见 `reports/results-short.md` §11）：
+  1. 满足：`kvcached_native` → `ca_full_tm_slo`，Code TTFT −48.7% [−51.4, −46.4]，Conv TPOT −24.6% [−26.4, −22.7]；
+  2. 落在"无 A 收益"一侧：`kvcached_native` → `ca_full_v2`，Code TTFT +0.5% [−2.9, +4.9]。迁移的 A 收益只相对全量预留成立；
+  3. 方向成立：`no_move_v2` → `kvcached_native`，Code TTFT −59.9%（大于预测），Conv TPOT +12.8%（在预测内）；
+  4. 满足：244/244 输出长度精确，23 次迁移全部通过，原生轮没有抢占，最大映射没有超过 170 个页组。
+  - 预测偏差：原生的 Code TTFT 54.1s，略低于预测区间 55–70s；Conv 抢占预测 0–20 次，实际 0 次。
+
+## 14. 当前长度准入：重跑全部策略（V8，11-04 用户要求）
+
+### 14.1 依据
+
+- 用户要求：
+  - serving 系统不能假设已知输出长度，准入按当前长度；
+  - 实验负载要设计成按当前长度长请求也进不来；
+  - KV 不够时触发 vLLM 的 retract（抢占重算）；
+  - placement 给请求留增长空间，但不假设已知完整输出长度；
+  - 新设定下重跑所有 baseline 和我们的系统。
+- 之前所有受控策略（V1–V7）都按 prompt + max_tokens 预留，而 max_tokens 是回放的真实输出长度，相当于 oracle。planner 的剩余长度和挑选顺序也用了它。这些结果只作历史参考。V7 的 `kvcached_native` 不依赖输出长度。
+
+### 14.2 v4 代码改动（"当前长度"设定）
+
+- **准入**：调度器 `prompt` 模式在 add_request 时只预留 prompt + 256 token（固定 extra，不随请求变化），之后每步按需增长。KV 不够时由 vLLM 原生抢占（FCFS，抢占最新请求，重算）。新增抢占次数和重算 token 计数。
+- **原生基线** `kvcached_native` 不变：vLLM 默认 `scheduler_reserve_full_isl=True`，即当前序列放得下才开始。
+- **planner 不再使用输出长度**：
+  - 剩余长度视为未知，所有请求在规划窗口内都计为仍在运行；
+  - 挑选顺序改为 `kv_desc` / `kv_asc`，回迁按 context；
+  - 到达请求只用 prompt。
+- **增长余量**：每个 Conv 的余量为 `conv_growth_tokens × 每 token KV`，取以下两项中的较大者：
+  - 单独运行速率下 `relief_horizon_s`=15s 的增长；
+  - 长请求驻留期间的增长。驻留时间 = 校准的 prefill 时间 + `decode_window_s`=10s，期间的速率在并行时取干扰下的速率，按需切片时只计切片窗口，全程分时时为 0。
+
+  每个 rank 再加 1 个页组的 slack。余量作用于 Code 的直接准入目标、迁移准入目标、所有迁移目的地和回迁目的地；迁移完成后，准入时再按新快照和余量复查一次。
+- **事务**：允许存在等待中或被抢占的请求，只要求被迁移的请求处于 decode。
+- **容量**：每一轮都用占位把 kvcached 可映射的共享 KV 对齐到 16 GiB（170 个 96 MiB 页组），轮后释放。控制器预算只作观察，不再强制。
+- **新增策略**：`no_move_fair_v2`、`ca_admit_v2`、`ca_return_v2`、`mig_random_tm_v2`，都使用 v2 控制面，用来补齐总表。
+- **测试**：35 个通过。新增测试覆盖：
+  - planner 不读输出长度；
+  - 余量约束；
+  - 按当前长度准入时 Code 直接进入，而旧的全量预留需要迁移；
+  - 原生和 `prompt` 模式在容量不足时都会触发 retract，且输出长度精确；
+  - 有被抢占请求时迁移事务照常完成；
+  - 每一轮都会加上占位。
+- 计划参数冻结为 `planner-params-v2.json`（SHA `00bcf6f7…`），即 v1 加上 `relief_horizon_s` 15、`decode_window_s` 10、`slack_pages` 1。
+
+### 14.3 simulator 与验证
+
+- 新增当前长度准入、原生按请求数路由（`waiting × 4 + running`）、按页的 retract（抢占该租户在该 rank 上最新的请求）和重算（每 4096 token 一个 chunk，`recompute_s_per_token` 1.25e-4）。
+- 旧模式下 5 个策略的输出与改写前逐位一致。
+- 原生模式在 V7 trace 上：
+  - Code 到达时各 rank 的 KV 与实测相差约 0.5 GiB 以内（660s：[4.41, 4.41, 6.47, 5.44] 对实测 [4.31, 4.59, 6.19, 5.91]）；
+  - Code 落点相同，均为 0 次抢占；
+  - Conv TPOT 32.8 对实测 31.3ms；
+  - Code TTFT 59–60s 对实测 48–60s。
+
+### 14.4 负载选择（只用非最终 seed 801–820）
+
+- Conv 0.07 RPS（V7 负载）时，按当前长度 Code 总能直接放进，迁移没有作用。
+- 被挡比例受两方面限制：
+  - 每个 rank 的 Conv KV 刚好在门槛附近，一个 Conv 结束就能腾出空间；
+  - 受控路由会在 Code 驻留的 rank 上留下空洞。
+- 被否决的候选：
+  - 14 GiB 上限或每轮更多 Code：不分时的策略整体过载，Code 并行拖慢 Conv 后积压，出现大量抢占；
+  - Code 晚于 540s 开始：每轮超过 27 分钟。
+- **选定**：16 GiB 上限，Conv 0.12 RPS，Code 在 420/540/660/780s，时长 900s，评估窗口 [420, 900)。seed 801–810 上：
+  - 原生被挡比例 0.40（被挡指 Code TTFT > 70s）；
+  - 原生 Code TTFT 180s，抢占 1.6 次；
+  - `ca_full_v2` 60s、0 次抢占；
+  - 分时策略 26–30s、0 次抢占；
+  - 墙钟 ≤ 1479s。
+- **seed 规则**（只依据 trace，不看任何策略结果）：从 901 起，取第一个同时满足以下两条的 seed：
+  - Conv 总数在 108 的 ±5% 以内；
+  - 各 Code 到达前 400s 内到达的 Conv 数之和 ≥ 0.12 × 400 × 4 = 192。
+
+  第二条的依据：seed 801–820 上，它与原生被挡比例的相关系数为 0.68。它会把选择偏向"Code 到达时负载较高"的 trace，正是本次要测的场景，结果报告中要注明。
+- **结果**：seed 911，105 个 Conv，前置 Conv 211。冻结为 `cur-b16-c012-p120-s911-d900.json`（SHA `ec488df7…`）。
+
+### 14.5 作业 V8
+
+- tag `v8-current-20261104`，`XPLACE_KV_MODE=prompt`，`XPLACE_RESERVE_EXTRA_TOKENS=256`，上限 16 GiB，探针 16.5ms，drain 超时 1000s，排除 d1n41a23g03。
+- 12 轮按重要性排序，两两组成一个不超过 1h 的实验：
+  1. `ca_full_tm_slo`, `kvcached_native`；
+  2. `no_move_v2`, `ca_full_v2`；
+  3. `ca_full_tm_v2`, `mig_random_v2`；
+  4. `no_move_tm_v2`, `mig_random_tm_v2`；
+  5. `ca_admit_v2`, `ca_return_v2`；
+  6. `ca_full_tm_s4`, `no_move_fair_v2`。
+- 模拟墙钟合计 4.3h，`--time 5:30:00`。
+
+### 14.6 预测（提交前写定，`forecast-v8-cur-s911.json`，每策略 20 个副本）
+
+| 策略 | Code TTFT | Conv TPOT | Conv TTFT | 抢占 | 迁移 |
+|---|---|---|---|---|---|
+| `ca_full_tm_slo` | 31.1s | 29.2ms | 0.8s | 0 | 11 |
+| `kvcached_native` | 166 [120, 195]s | 39.0ms | 0.2s | 1.9 | 0 |
+| `no_move_v2` | 168 [120, 207]s | 34.6ms | 0.2s | 0.1 | 0 |
+| `ca_full_v2` | 60.7s | 38.9ms | 0.2s | 0 | 18 |
+| `ca_full_tm_v2` | 25.7s | 28.9ms | 3.2s | 0 | 20 |
+| `mig_random_v2` | 60.2s | 40.0ms | 0.2s | 0 | 4 |
+| `no_move_tm_v2` | 57.4s | 28.4ms | 3.1s | 0 | 0 |
+| `mig_random_tm_v2` | 25.6s | 29.4ms | 3.2s | 0 | 5 |
+| `ca_admit_v2` | 62.2s | 40.2ms | 0.2s | 0 | 5 |
+| `ca_return_v2` | 60.9s | 39.1ms | 0.3s | 0 | 19 |
+| `ca_full_tm_s4` | 34.1s | 29.3ms | 0.7s | 0 | 12 |
+| `no_move_fair_v2` | 130s | 35.1ms | 20.3s | 0 | 0 |
+
+主要对比的预测：
+- `kvcached_native` → `ca_full_tm_slo`：Code TTFT −79.0% [−82.9, −73.9]，Conv TPOT −24.9% [−30.5, −16.9]；
+- `kvcached_native` → `ca_full_v2`：Code TTFT −59.0% [−71.2, −47.5]，Conv TPOT +0.2%；
+- `no_move_v2` → `mig_random_v2`：Code TTFT −62.4%，Conv TPOT +15.8%；
+- `mig_random_v2` → `ca_full_v2`：Conv TPOT −2.9% [−8.3, +1.5]，Code TTFT +1.1%，预计测不出；
+- `ca_full_v2` → `ca_full_tm_slo`：Code TTFT −48.6%，Conv TPOT −25.0%。
+
+### 14.7 判定
+
+1. **问题存在**：`kvcached_native` 至少 1 个 Code 的 TTFT > 70s，即按当前长度放不进。
+2. **A 相对原生成立**：`kvcached_native` → `ca_full_v2`，Code TTFT 显著更低。
+3. **整体**：`kvcached_native` → `ca_full_tm_slo`，Code TTFT 降 ≥ 60%，Conv TPOT 降 ≥ 15%，Conv SLO ≥ 0.95。
+4. **retract**：迁移和分时策略的抢占次数不多于 `kvcached_native`。
+5. **Conv 退化 ≤ 20%**：所有迁移和分时策略的 Conv TPOT 相对 `kvcached_native` 和 `no_move_v2` 都不超过 +20%。
+6. **正确性**：输出长度精确；所有迁移逐字节校验通过；抢占重算后输出长度依然精确。
+- placement B（`mig_random_v2` → `ca_full_v2`）预计在噪声内，如实报告。
+
+### 14.8 增长余量消融（V8b，排在 V8 之后）
+
+- **依据**（simulator，非最终 seed 801–810，各 10 个 seed）：
+
+  | 余量设置 | `ca_full_tm_slo` 抢占 均值 / 最大 | `ca_full_v2` 抢占 | `mig_random_v2` 抢占 |
+  |---|---|---|---|
+  | 不留 | 1.7 / 17 | 0.3 | 2.9 |
+  | v2（15s、10s、1 页组） | 0 / 0 | 0 | 2.4 |
+  | 加倍 | 0 / 0 | 0.5 | 2.9 |
+
+  Code TTFT 在三档之间相差不超过 0.5s。不留余量时，迁移把 Conv 塞进目的 rank，这些 Conv 恢复生成后很快用完空间；随机迁移不检查余量。
+- **新增策略**：`ca_full_v2_nh`、`ca_full_tm_slo_nh`，与原策略相同，只把增长余量和 slack 都置零（`no_headroom`）。测试 36 个通过（新增：`_nh` 准入时余量为 0，默认策略大于 0）。
+- **seed 911 上的预测**（`forecast-v8b-headroom-s911.json`，每个策略 20 个副本）：
+  - `ca_full_v2_nh`：抢占 23.4 [3.9, 39.4] 次，`ca_full_v2` 为 0；Code TTFT 60.6 对 61.2s，Conv TPOT 38.8 对 39.1ms。
+  - `ca_full_tm_slo_nh`：抢占 0 次，与 `ca_full_tm_slo` 相同（这个 trace 没有触发挤爆）；Code TTFT 29.8 对 31.1s。
+- **作业 V8b**：tag 与 V8 相同（代码变化后需重新 build，tag 为 `v8b-headroom-20261104`），2 轮：`ca_full_v2_nh`、`ca_full_tm_slo_nh`，`--time 1:00:00`，依赖 V8（afterany）。与 V8 中的 `ca_full_v2`、`ca_full_tm_slo` 做跨作业比较，需注明是否在同一节点、探针读数是否相近。
+- **判定**：
+  - `ca_full_v2_nh` 的抢占次数多于 `ca_full_v2`；
+  - Code TTFT 差距在 ±10% 以内（余量不应明显拖慢 Code 准入）；
+  - 分时这一对如实报告，预计无差别。
+
+## 15. 页共享下的修正与重跑（V9）
+
+### 15.1 依据（V8 第一轮实测）
+
+- V8 第一轮 `ca_full_tm_slo`（`max_moves`=8）：660s、780s 两个 Code 的迁移规划全部不可行（172 次），等 375s、286s 后才直接准入，TTFT 401s、313s；0 次迁移准入，0 次抢占。
+- **原因是页共享**：
+  - 按当前长度逐步增长时，kvcached 给单个块挑"最满但有空位"的页，同一 rank 上的 Conv 块交错在同一批 2 MiB 页里；
+  - Conv 结束留下的空位会被其他 Conv 的增长填上，页很少整页空出，Conv 映射停在历史高点；
+  - Code 属于另一个模型，用不了 Conv 页里的空位；
+  - 只迁走部分 Conv 释放不了页，必须清空整张 rank，而 `max_moves`=8 小于每 rank 的 Conv 数（13–14）。
+- **佐证**：V7 原生轮 rank 2 的 Conv 从 8 降到 2，映射一直是 7.41 GiB；kvcached 对全空的页立即释放（`kv_cache_manager.free`），排除了延迟释放。
+- 旧设定下请求在准入时一次性预留全部长度，基本独占自己的页，所以 V1–V7 的迁移可行；simulator 一直按独占页建模。
+
+### 15.2 改动（v4.1）
+
+- **simulator 页共享模型**：Conv 的物理页按每个 rank 的历史高点计算，由该 rank 上所有持有块的 Conv 共有，只有 Conv 全部离开时才归零；Code 的大块分配仍按独占页；planner 看到同样的页归属。
+  - 旧模式 5 个策略的输出逐位不变；
+  - 重现 V8 第一轮：660s 各 rank [6.66, 7.59, 8.72, 9.75] GiB，实测 [6.75, 7.69, 7.97, 9.47]；`max_moves`=8 时 Code 也被长时间挡住。
+- **允许清空整张 rank**：`planner-params-v3.json`（SHA `32a5a49e…`），`max_moves` 24，其余同 v2。挑选逻辑不变：仍取能腾出空间的最短前缀，在页共享下通常就是该 rank 上的全部可迁 Conv。
+- **有 Code 驻留时不回迁**（当前长度设定）：
+  - 原因：清空一张 rank 后 Conv 分布严重不均，回迁检查会在 Code prefill 期间发起回迁，迁移与 prefill 争带宽（实测每次约 3.6s），事务持锁约 25s，挡住新 Conv 的准入；
+  - Code 完成时那次回迁照常；
+  - 模拟中 `ca_full_tm_slo` 的 Conv TTFT p99 因此从 31s 降到 4.2s。
+- 测试 37 个通过（新增：有 Code 驻留时不发起回迁；`_nh` 消融的余量为 0）。
+
+### 15.3 作业 V9
+
+- tag `v9-evacuate-20261104`，代码 v4.1；trace 仍为 seed 911（`cur-b16-c012-p120-s911-d900.json`）；`planner-params-v3.json`；`XPLACE_KV_MODE=prompt`，extra 256；上限 16 GiB；探针 16.5ms；drain 超时 1000s；排除 d1n41a23g03。
+- 14 轮，按重要性排序：
+  1. `ca_full_tm_slo`, `kvcached_native`
+  2. `no_move_v2`, `ca_full_v2`
+  3. `ca_full_tm_v2`, `mig_random_v2`
+  4. `no_move_tm_v2`, `mig_random_tm_v2`
+  5. `ca_admit_v2`, `ca_return_v2`
+  6. `ca_full_v2_nh`, `ca_full_tm_slo_nh`
+  7. `ca_full_tm_s4`, `no_move_fair_v2`
+- 模拟墙钟合计 5.0h，`--time 6:30:00`。依赖 V8（`afterany`）：V8 跑完原生、`no_move_v2` 两轮后撤销，其余轮次因页共享问题已无效。
+- V8 的原生、`no_move_v2` 两轮作为跨作业重复，用于估计轮次间波动。
+
+### 15.4 预测（`forecast-v9-cur-s911.json`，SHA `2d04059d…`，每策略 20 个副本，页共享模型）
+
+| 策略 | Code TTFT | Conv TPOT | Conv TTFT | 抢占 | 迁移 |
+|---|---|---|---|---|---|
+| `ca_full_tm_slo` | 30.3s | 29.3ms | 0.7s | 0 | 55 |
+| `kvcached_native` | 474 [442, 494]s | 27.9ms | 0.1s | 0.9 | 0 |
+| `no_move_v2` | 280 [270, 288]s | 29.9ms | 0.2s | 0 | 0 |
+| `ca_full_v2` | 60.6s | 39.2ms | 0.2s | 0 | 42 |
+| `ca_full_tm_v2` | 26.1s | 29.0ms | 3.3s | 0 | 54 |
+| `mig_random_v2` | 60.2s | 41.8ms | 0.2s | 3.6 | 15 |
+| `no_move_tm_v2` | 233s | 25.7ms | 2.4s | 0 | 0 |
+| `mig_random_tm_v2` | 25.9s | 30.6ms | 3.3s | 0 | 13 |
+| `ca_admit_v2` | 61.8s | 41.9ms | 0.2s | 0.1 | 15 |
+| `ca_return_v2` | 61.0s | 39.4ms | 0.2s | 0 | 42 |
+| `ca_full_tm_s4` | 34.0s | 29.5ms | 0.7s | 0 | 46 |
+| `no_move_fair_v2` | 219s | 29.9ms | 72s | 0 | 0 |
+| `ca_full_v2_nh` | 61.8s | 39.6ms | 0.2s | 0.1 | 42 |
+| `ca_full_tm_slo_nh` | 30.3s | 29.3ms | 0.7s | 0 | 55 |
+
+主要对比：
+- `kvcached_native` → `ca_full_tm_slo`：Code TTFT −93.5% [−93.9, −93.1]，Conv TPOT +5.3% [+0.7, +13.0]。原生让大部分 Code 排队约 10 分钟，Conv 较少受干扰。
+- `kvcached_native` → `ca_full_v2`：Code TTFT −87.1%，Conv TPOT +40.8%（不分时，超出 20% 的退化上限）。
+- `no_move_v2` → `ca_full_tm_slo`：Code TTFT −89.2%，Conv TPOT −1.9%。
+- `mig_random_v2` → `ca_full_v2`：Conv TPOT −6.2% [−11.0, −1.1]，Code TTFT +0.9%。其中 `ca_return_v2` −5.7%，`ca_admit_v2` +0.3%。
+- `ca_full_v2_nh` → `ca_full_v2`：差别在噪声内（页共享下 Conv 增长先填空洞，余量作用小），抢占 0.1 对 0。
+- `no_move_v2` → `no_move_tm_v2`：Code TTFT −16.7%，Conv TPOT −14.0%。
+
+### 15.5 判定
+
+1. **问题存在**：`kvcached_native` 至少 2 个 Code 的 TTFT > 70s。
+2. **清空整张 rank 有效**：所有迁移策略的 660s、780s 两个 Code 走迁移准入。不分时的 Code TTFT ≤ 70s，分时的 ≤ 40s。
+3. **整体**：
+   - `kvcached_native` → `ca_full_tm_slo`：Code TTFT 降 ≥ 60%，Conv TPOT 退化 ≤ 20%，Conv SLO ≥ 0.95；
+   - `no_move_v2` → `ca_full_tm_slo`：Code TTFT 降 ≥ 60%，Conv TPOT 退化 ≤ 20%。
+4. **retract**：`ca_full_tm_slo` 的抢占次数不多于 `kvcached_native`。
+5. **正确性**：输出长度精确；迁移全部逐字节校验通过。
+- placement B（`mig_random_v2` → `ca_full_v2`）与余量消融如实报告。
+
+### 15.6 补充（V8 原生轮失败后，提交 V9 前写定）
+
+- **V8 原生轮**（`kvcached_native`，seed 911）在 1900s（trace 900s + drain 1000s）内没跑完，抛 TimeoutError，作业失败。到 1900s：
+  - 只完成 38/109 个请求；
+  - 660s、780s 的两个 Code 一直没开始；
+  - Conv 约 350ms/token。
+- **原因**（vLLM `DPEngineCoreProc.run_busy_loop`）：
+  - 本地有未完成请求（包括 KV 不足而排队的请求）时，引擎每轮执行 dummy batch；只要有一个 rank 还有排队请求，DP wave 就不停；
+  - 被 KV 挡住的 Code 让 Code 实例的 4 个 rank 一直空跑 EP 前向，干扰 Conv；Conv 变慢后 KV 不释放，Code 更进不来，形成正反馈；
+  - 受控策略在控制器侧排队，不受影响。
+- **代码 v4.2**：
+  - 截止时截断：记录部分进度，没出首 token 的请求 TTFT 记为下界，abort 后继续下一轮，不再让整个作业失败；
+  - `report_main` 读入截断记录（作为下界参与配对，会低估原生的 Code TTFT，结论偏保守）；
+  - simulator 增加 DP 空转干扰。旧模式逐位不变；重现 V8 原生轮：1900s 时完成 33/109，2 个 Code 未开始。
+  - 测试 39 个通过。
+- **V9 轮次重排**：原生放在最后，在 1900s 截断。
+  1. `ca_full_tm_slo`, `no_move_v2`
+  2. `ca_full_v2`, `mig_random_v2`
+  3. `ca_full_tm_v2`, `no_move_tm_v2`
+  4. `mig_random_tm_v2`, `ca_admit_v2`
+  5. `ca_return_v2`, `ca_full_v2_nh`
+  6. `ca_full_tm_slo_nh`, `ca_full_tm_s4`
+  7. `no_move_fair_v2`, `kvcached_native`
+
+  tag `v9b-censor-20261104`，`--time 6:30:00`，其余设置同 §15.3。
+- **预测**（`forecast-v9b-cur-s911.json`）：受控策略与 §15.4 相同。原生方式不截断时需 5748s 跑完，Code TTFT 2527s。在 1900s 截断时预计：
+  - 完成约 33/109；
+  - 2 个 Code 未开始，TTFT 下界约 1240s、1120s；
+  - 4 个 Code 的截断 TTFT 均值不低于约 620s；
+  - 停滞期间 Conv 约 280ms/token。
+- **判定**：沿用 §15.5。判定 1 改为：`kvcached_native` 至少 2 个 Code 的 TTFT（含下界）> 70s。原生方式的配对对比使用截断下界。
+
+### 15.7 补充：迁移规划被物理空闲块检查挡住（V9c 第一轮，提交 V10 前写定）
+
+- **V9c 第一轮**（`ca_full_tm_slo`，`max_moves` 24，d1n41a22g02）：660s 的 Code 仍有 49 次规划不可行，0 次迁移。
+- **根因**：planner 的 `_select_for_target` 在选任何要迁的请求之前，先检查 Code 池的 `free_blocks` 是否不少于 Code 所需块数，不满足就直接返回不可行；`plan_usage` 对到达请求也是同样的检查。
+  - kvcached 的 `get_num_free_blocks()` 等于 `available_size()`，即物理空闲（`cudaMemGetInfo` − 2% 余量）加池内空位；
+  - 没有占位时物理空闲约 35 GiB，这个检查从不起作用；占位后它成为真正的约束，而它没有计入迁走 Conv 后释放的页；
+  - 655s 时的 rank 0：已用 6.75 GiB，空闲约 6,300 块 + 63 个空位，Code 需要 6,371 块，所以在任何迁移之前就被判定不可行；
+  - V8 第一轮的不可行，首先也是这个原因。页共享（§15.1）是另一个真实存在、叠加在上面的约束，`max_moves` 24 仍然需要。
+  - simulator 的 `free_blocks` 固定为 10^7，所以没暴露。
+- **改动 v4.3**：
+  - planner：Code 能否放进，用"当前空闲块 + 计划迁出后释放的块"判断；不够时继续增加要迁的请求，而不是直接返回不可行；
+  - 不可行时返回每个目标 rank 的诊断（失败阶段、可迁数、所需块和空闲块、全部迁出后可释放的量），写进 decisions；
+  - 按步增长的各轮，控制器预算设为占位后的实际可映射容量（170 个页组，15.9375 GiB），不再用 16.0 GiB；
+  - simulator：按当前长度准入时报告真实的 `free_blocks`（空位 + 物理空闲页），预算同样对齐；
+  - fake 引擎同样报告物理空闲块；
+  - 测试 41 个通过（新增：空闲块不够但迁出后够用时必须能规划出迁移；不可行时有诊断）。
+  - 旧模式 5 个策略逐位一致。修复前的 planner 加上真实的 `free_blocks`，在 seed 911 上重现了真机：0 次迁移准入，660s、780s 的 Code TTFT 486s、395s（V8 实测 401s、313s）。
+- **作业 V10**：tag `v10-freeblocks-20261105`，14 轮顺序与 §15.6 相同（原生最后，1900s 截断），`--time 6:30:00`，其余设置同 §15.3。
+- **预测**：`forecast-v10-cur-s911.json`（SHA 前缀见 progress.md），与 §15.4/§15.6 相同，判定同 §15.5/§15.6。
+- V9c 的第一轮（`ca_full_tm_slo`，迁移不可行）与 V8 第一轮一起，作为"规划不能腾出空间"情形的两次跨节点重复；第二轮 `no_move_v2` 作为基线的跨作业重复。
+
+## 16. 复现 seed（V11，排在 V10 之后）
+
+- **目的**：总表的核心对比在第二个 trace 上复现，判断 seed 911 上的结论是否依赖具体 trace。
+- **seed**：沿用 §14.4 的规则（只看 trace），从 912 起，取第一个满足条件的，结果为 914（113 个 Conv，前置 Conv 218）。冻结为 `cur-b16-c012-p120-s914-d900.json`（SHA `8a777986…`）。seed 914 上没有调过任何参数。
+- **代码与参数**：与 V10 相同（v4.3，`planner-params-v3`），只换 trace。tag `v11-replicate-20261105`。
+- **8 轮**：
+  1. `ca_full_tm_slo`, `no_move_v2`
+  2. `ca_full_v2`, `mig_random_v2`
+  3. `ca_full_tm_v2`, `no_move_tm_v2`
+  4. `mig_random_tm_v2`, `kvcached_native`（原生最后，1900s 截断）
+
+  `--time 4:00:00`（模拟墙钟 3.1h），依赖 V10（`afterany`）。
+- **预测**（`forecast-v11-cur-s914.json`，SHA `7278947c…`，每策略 20 个副本）：
+
+  | 策略 | Code TTFT | Conv TPOT | 抢占 |
+  |---|---|---|---|
+  | `ca_full_tm_slo` | 29.7s | 30.2ms | 0 |
+  | `no_move_v2` | 469s | 27.3ms | 0 |
+  | `ca_full_v2` | 61.4s | 39.4ms | 0 |
+  | `mig_random_v2` | 60.2s | 41.1ms | 5.8 |
+  | `ca_full_tm_v2` | 26.1s | 29.7ms | 0 |
+  | `no_move_tm_v2` | 376s | 26.1ms | 0 |
+  | `mig_random_tm_v2` | 25.8s | 32.9ms | 4.0 |
+  | `kvcached_native` | 不截断需 6000s；1900s 截断时 3 个 Code 未开始 | 停滞期约 290ms | 6.8 |
+
+  主要对比：
+  - `no_move_v2` → `ca_full_tm_slo`：Code TTFT −93.7%，Conv TPOT +10.7% [+7.6, +13.3]（在 20% 内）；
+  - `mig_random_tm_v2` → `ca_full_tm_v2`：Conv TPOT −9.7%，抢占 4 → 0。分时下 placement 的 B 首次被预测为可测出，来源是随机迁移的目的地没留增长余量，引发 retract；
+  - `mig_random_v2` → `ca_full_v2`：Conv TPOT −4.2% [−8.9, +0.1]；
+  - `ca_full_v2` → `ca_full_tm_slo`：Code TTFT −51.5%，Conv TPOT −23.3%。
+- **判定**（与 §15.5 相同，在 seed 914 上复现）：
+  1. 原生至少 2 个 Code 的 TTFT（含下界）> 70s；
+  2. 迁移策略的 660s 及之后的 Code 都走迁移准入，不分时 ≤ 70s，分时 ≤ 40s；
+  3. `ca_full_tm_slo` 对 `no_move_v2`：Code TTFT 降 ≥ 60%，Conv TPOT 退化 ≤ 20%；
+  4. 正确性同前。
+- 与原生的配对对比使用截断下界（原生停滞期的 Conv TPOT 只计到截止时间，比完整运行乐观）。
+
+## 17. seed 914 补齐总表（V12，排在 V11 之后，提交前写定）
+
+### 17.1 依据
+
+- **V11 前 4 轮**（seed 914）与 V10 一致。`mig_random_v2` 在排空阶段（980–1241s）出现 10 次抢占，`ca_full_v2` 为 0 次。
+  - 机制：随机迁移不回迁。Conv 继续增长后，最满的 rank 先后达到容量；被抢的是迁入的请求和迟到的新请求。
+  - 要分开增长余量、代价感知准入和回迁各自的作用，需要 seed 914 上的 R5（`ca_admit_v2`）、R6（`ca_return_v2`）、R13（`ca_full_v2_nh`），并与同一作业中的 R4、R7 配对。
+- **跨作业比较的噪声**：`no_move_v2` 在 V9c、V10 上的 Conv TPOT 相差 3.6%（不同节点），与不分时下 B 的幅度（约 4%）相当。所以每个新行的父行都放进同一作业。
+- **更正**（与 §15.2 的预期不同）：真机上的准入没有一次清空整张 rank。V10 的 18 次准入在目标 rank 的 12–17 个 Conv 中迁走 2–13 个（中位 9 个）。planner 按快照的页归属计算可释放的页；simulator 用"高水位"页模型，每次都迁走目标 rank 上的全部 Conv，所以模拟的准入迁移数偏多。
+
+### 17.2 设计
+
+- **代码与输入**：与 V11 完全相同，复用 tag `v11-replicate-20261105` 的 upload（manifest `0d5d9bd9…`），只改 `XPLACE_POLICIES`。
+- **9 轮**（按重要性，两两组成不超过 1h 的实验）：
+  1. `ca_return_v2`, `mig_random_v2`（R6 对 R4）
+  2. `ca_full_v2_nh`, `ca_full_v2`（R13 对 R7）
+  3. `ca_admit_v2`, `ca_full_tm_slo`（R5 对 R4；R12 锚点）
+  4. `ca_full_tm_slo_nh`, `ca_full_tm_s4`（R14、R11 对 R12）
+  5. `no_move_fair_v2`（R3，对 V11 的 R2 做跨作业比较，效应远大于噪声）
+- **重复**：R4、R7、R12 在 V11 中各跑过 1 轮，这次是第二轮，可以估计轮次间波动。
+- **作业**：`--time 4:15:00`（9 轮约 3.4h），依赖 `afterany:289851`，排除 d1n41a23g03，其余同 V11。
+
+### 17.3 预测（`forecast-v12-cur-s914.json`，SHA `58c8f407…`，每策略 20 个副本）
+
+| 策略 | Code TTFT | Conv TPOT | Conv TTFT | 抢占 | 迁移 |
+|---|---|---|---|---|---|
+| `ca_return_v2` | 58.9s | 38.8ms | 0.3s | 0 | 59 |
+| `mig_random_v2` | 59.8s | 40.9ms | 0.3s | 5.8 | 14 |
+| `ca_full_v2_nh` | 61.3s | 39.3ms | 0.2s | 1.4 | 63 |
+| `ca_full_v2` | 60.8s | 39.1ms | 0.2s | 0 | 67 |
+| `ca_admit_v2` | 60.9s | 40.8ms | 0.3s | 1.9 | 20 |
+| `ca_full_tm_slo` | 29.7s | 30.2ms | 0.9s | 0 | 66 |
+| `ca_full_tm_slo_nh` | 29.7s | 29.8ms | 0.9s | 0 | 66 |
+| `ca_full_tm_s4` | 33.3s | 30.3ms | 1.2s | 0 | 67 |
+| `no_move_fair_v2` | 284s | 31.7ms | 136s | 0 | 0 |
+
+主要对比：
+- `mig_random_v2` → `ca_return_v2`：Conv TPOT −5.0% [−10.0, −0.4]，抢占 5.8 → 0；
+- `mig_random_v2` → `ca_admit_v2`：Conv TPOT −0.2% [−5.5, +4.5]，抢占 5.8 → 1.9；
+- `ca_full_v2_nh` → `ca_full_v2`：Conv TPOT −0.4% [−4.6, +3.1]，抢占 1.4 → 0；
+- `ca_full_tm_slo_nh` → `ca_full_tm_slo`：Conv TPOT +1.3%，两者都没有抢占；
+- `ca_full_tm_s4` → `ca_full_tm_slo`：Code TTFT −10.8%，Conv TPOT −0.5%；
+- `no_move_v2` → `no_move_fair_v2`：Code TTFT −39.4%，Conv TTFT 0.1 → 136s。
+
+### 17.4 判定
+
+1. **回迁带来 B**：`mig_random_v2` → `ca_return_v2` 的 Conv TPOT 配对 CI 上界 < 0。
+2. **代价感知准入约为 0**：`mig_random_v2` → `ca_admit_v2` 的 Conv TPOT 变化在 ±2% 内，或 CI 含 0。
+3. **抢占**：`ca_return_v2`、`ca_full_v2` 都是 0 次；`mig_random_v2` 的抢占次数如实报告（V11 为 10 次，预测 5.8 次）。
+4. **增长余量**：如实报告。若 `ca_full_v2_nh` 有抢占而 `ca_full_v2` 没有，记为"余量在 seed 914 上防止了抢占"；否则维持 V10 的负结果。
+5. **切片**：`ca_full_tm_s4` → `ca_full_tm_slo` 的 Code TTFT 变化 < 0。
+6. **公平门**：`no_move_fair_v2` 的 Conv TTFT 至少是 V11 `no_move_v2`（0.36s）的 10 倍。
+7. **正确性**：输出长度精确，迁移全部逐字节校验通过。
+- R4、R7、R12 与 V11 同名轮次的差别作为轮次间波动报告，不设判定。
+
+### 17.5 补充：simulator 改用块级页模型（V12 开始前写定）
+
+- **改动**：`sim/simulator.py` 新增 `PagePool`，逐页模拟 kvcached 的分配器（`KVCacheManager._alloc_impl` / `_free`）：
+  - 单块的 decode 增长放进有空位的最满页；
+  - 一次分配多块（准入、迁入、重算）时，先找能放下整段的最小页，否则用最空的页，重复直到分完；
+  - 所有已映射页都没有空位时才映射新页，页内块全部释放后取消映射；
+  - 请求增长先用空位；只有需要新页且 GPU 已满时，才抢占本租户在该 rank 上最新的请求（vLLM FCFS）。
+  - 快照中的页归属与真机一致，planner 的 `released_gib` 只计入所有者全部被迁走的页。
+  - 新参数 `page_model`，默认改为 `blocks`；`high_water` 为旧规则（一张 rank 上还有 Conv 时页只增不减），V8–V12 的预测都用它。`sim/predict.py` 新增 `--page-model`。
+- **回归**：`--page-model high_water` 逐位重现 `forecast-v12-cur-s914.json`。
+- **一致性**：每 5s 检查一次，各 rank 池内已分配块数等于该 rank 上请求持有的块数；跑完后所有池为空。
+- **对真机验证**：V10 的 13 个受控轮加 V11 的前 6 轮，每轮 10 个噪声副本：
+
+  | 指标 | 真机 | 高水位 | 块级 |
+  |---|---|---|---|
+  | `mig_random_v2` 的抢占（seed 911 / 914） | 0 / 10 | 4.5 / 6.2 | 0.0 / 11.5 |
+  | 迁移数：`mig_random_v2`、`ca_admit_v2`、`ca_return_v2`、`mig_random_tm_v2`（911） | 9、9、48、22 | 15.0、14.6、42.9、13.0 | 9.0、9.0、48.0、22.0 |
+  | 迁移数：`ca_full_tm_slo`（911 / 914） | 30 / 32 | 55 / 66 | 31 / 51 |
+  | Code TTFT 绝对误差，均值 / 中位数 | | 6.8% / 2.6% | 5.2% / 1.6% |
+  | Conv TPOT 绝对误差，均值 / 中位数 | | 2.2% / 1.7% | 2.1% / 1.7% |
+
+  - 仍有的偏差：
+    - 不迁移的分时策略在 seed 914 上 Code TTFT 偏高 45%（高水位 60%）。这是阈值效应：
+      - 540s 时真机 rank 2 已用 5.81 GiB，加上 Code 和余量正好到上限，Code 直接进入；
+      - 模拟中各 rank 的 Conv 数相同，但 rank 2 多映射 4 页（6.19 GiB），Code 被挡到 1056s；
+      - 之后两个 Code 的准入时间与真机相近（1082s、1108s 对 1128s、1155s）；
+    - 不分时 `ca_full_v2` 在 911 上的迁移数 32.5 对 58；
+    - 不分时策略的 Conv TPOT 低估 2–3.6%。
+  - V10 的原生轮在 1900s 时完成 33/109、抢占 1 次，与真机相同。
+- **块级模型的 V12 预测**：`forecast-v12b-blocks-s914.json`（SHA `a8155f7f…`），作为 V12 对新模型的样本外检验；判定仍按 §17.4。
+
+  | 策略 | Code TTFT | Conv TPOT | 抢占 | 迁移 |
+  |---|---|---|---|---|
+  | `ca_return_v2` | 58.8s | 39.2ms | 0.2 | 50 |
+  | `mig_random_v2` | 60.0s | 42.4ms | 11.9 | 20 |
+  | `ca_full_v2_nh` | 61.0s | 39.2ms | 2.4 | 46 |
+  | `ca_full_v2` | 60.6s | 39.1ms | 0.1 | 55 |
+  | `ca_admit_v2` | 60.8s | 41.5ms | 5.7 | 12 |
+  | `ca_full_tm_slo` | 30.7s | 30.2ms | 0 | 51 |
+  | `ca_full_tm_slo_nh` | 30.5s | 29.9ms | 0 | 37 |
+  | `ca_full_tm_s4` | 33.7s | 30.1ms | 0 | 40 |
+  | `no_move_fair_v2` | 280s | 31.3ms | 0 | 0 |
+
+  主要对比：
+  - `mig_random_v2` → `ca_return_v2`：Conv TPOT −7.6% [−12.3, −3.3]，抢占 11.9 → 0.2；
+  - `mig_random_v2` → `ca_admit_v2`：−2.0% [−7.0, +2.4]，抢占 11.9 → 5.7；
+  - `ca_full_v2_nh` → `ca_full_v2`：−0.2% [−4.8, +4.0]，抢占 2.4 → 0.1；
+  - `ca_full_tm_s4` → `ca_full_tm_slo`：Code TTFT −8.9%。
+
+## 18. RQ4 的真机锚点（V13，排在 V12 之后，提交前写定）
+
+### 18.1 依据
+
+- RQ4（论文图 10）的负载与 KV 预算曲线来自 simulator（results-short §12.7），需要在真机工作点之外的位置各有一个锚点。
+- **两个锚点**：
+  - **KV 充足**：seed 911 trace，KV 上限 24 GiB/卡。模拟中碎片消失，原生与受控基线的 Code TTFT 都约为 60s，本文的收益全部来自分时。这一点回答"16 GiB 上限是否是人为制造的"。
+  - **更重负载**：Conv 0.14 RPS，16 GiB/卡。模拟中随机迁移抢占约 17 次，代价感知约 0.6 次；不分时的代价感知不留增长余量时为 2.5 次。这里检验"placement 要为增长留空间"。
+- **不加重复轮**：规则在 V12 第六轮结果出来前写定（分时下同一策略两次运行的 Conv TPOT 差超过 3% 才加）。实测 V11 → V12 的 `ca_full_tm_slo` 为 +1.8%，所以不加。λ=0.14 的锚点本身包含分时下的随机 / 代价感知配对，作为分时下 B 的第三个独立 trace。
+
+### 18.2 负载
+
+- **seed 规则**：沿用 §14.4 的规则（只看 trace），按 0.14 RPS 缩放：Conv 总数在 0.14 × 900 = 126 的 ±5% 内，各 Code 到达前 400s 内的 Conv 数之和 ≥ 0.14 × 400 × 4 = 224。从 915 起，第一个满足的是 919（120 个 Conv，前置 227）。
+- 冻结为 `cur-b16-c014-p120-s919-d900.json`（SHA `81c3d0c0…`）。seed 919 上没有调过任何参数。
+- seed 911 的 trace 与 V10 相同（SHA `ec488df7…`）。
+
+### 18.3 设计
+
+- **运行时 segments**（只改了 `main.py`；planner、调度器补丁、trace runner 与 V10–V12 相同）：一个作业按顺序运行多个 {label, trace, KV 上限, 策略}，输出到 `trace/<label>/<policy>`。不给 segments 时行为不变。
+- **10 轮，按重要性排序**（`segments-v13-anchors.json`，SHA `2d6b20c1…`）：
+  1. `s919-l14`（λ=0.14，16 GiB）：`ca_full_tm_slo`, `no_move_v2`, `mig_random_tm_v2`, `ca_full_tm_v2`；
+  2. `s911-c24`（seed 911，24 GiB）：`ca_full_tm_slo`, `no_move_v2`, `kvcached_native`；
+  3. `s919-l14-corun`（λ=0.14，16 GiB）：`mig_random_v2`, `ca_full_v2`, `ca_full_v2_nh`。
+  
+  λ=0.14 拆成两个 segment，只是为了让不分时的三轮排到最后；分析时把两个目录合并，属于同一作业配对。
+- 原生方式只在 24 GiB 下运行。λ=0.14、16 GiB 下模拟的原生 20 个副本都没在 trace + 1000s 内跑完，与 V10/V11 的截断结论相同，不再花一轮。
+- **作业**：`--time 4:45:00`（模拟墙钟合计约 3.6h，加启动和每轮约 100s 的开销约 3.9h），依赖 `afterany:290422`，排除 d1n41a23g03，探针上限 16.5ms，其余同 V12。
+
+### 18.4 预测（块级页模型，每策略 20 个副本）
+
+- **`forecast-v13-s919-l14.json`**（SHA `c50f489e…`）：
+
+  | 策略 | Code TTFT | Conv TPOT | Conv TTFT | 抢占 [p5, p95] | 迁移 |
+  |---|---|---|---|---|---|
+  | `ca_full_tm_slo` | 29.4s | 29.6ms | 0.44s | 0 | 45 |
+  | `no_move_v2` | 551s | 33.9ms | 0.04s | 0 | 0 |
+  | `mig_random_tm_v2` | 26.1s | 31.3ms | 2.0s | 0 | 22 |
+  | `ca_full_tm_v2` | 25.9s | 29.4ms | 2.0s | 0 | 43 |
+  | `mig_random_v2` | 60.7s | 42.9ms | 0.24s | 17.4 [8.9, 28.7] | 26 |
+  | `ca_full_v2` | 61.1s | 40.1ms | 0.23s | 0.6 [0, 3.0] | 56 |
+  | `ca_full_v2_nh` | 61.4s | 39.9ms | 0.23s | 2.5 [0, 11.1] | 45 |
+
+  - `no_move_v2` → `ca_full_tm_slo`：Code TTFT −94.7%，Conv TPOT −12.7% [−14.4, −10.3]；
+  - `mig_random_tm_v2` → `ca_full_tm_v2`：Conv TPOT −6.0%；
+  - `mig_random_v2` → `ca_full_v2`：Conv TPOT −6.6% [−11.6, −2.7]，抢占 17.4 → 0.6；
+  - `ca_full_v2_nh` → `ca_full_v2`：Conv TPOT +0.6% [−4.4, +5.6]，抢占 2.5 → 0.6。
+- **`forecast-v13-s911-c24.json`**（SHA `9cb6f3d4…`）：
+
+  | 策略 | Code TTFT | Conv TPOT | Conv TTFT | 抢占 | 迁移 |
+  |---|---|---|---|---|---|
+  | `ca_full_tm_slo` | 29.6s | 29.0ms | 0.71s | 0 | 14 |
+  | `no_move_v2` | 59.6s | 39.6ms | 0.22s | 0 | 0 |
+  | `kvcached_native` | 60.5s | 40.0ms | 0.21s | 0 | 0 |
+
+  - `no_move_v2` → `ca_full_tm_slo`：Code TTFT −50.3%，Conv TPOT −26.9% [−28.8, −24.9]；
+  - `kvcached_native` → `no_move_v2`：Code TTFT −1.3% [−11.2, +9.2]，Conv TPOT −0.9%；
+  - `kvcached_native` → `ca_full_tm_slo`：Code TTFT −51.0%，Conv TPOT −27.5%。
+- **分时策略的预测区间是退化的**（p5 = p95）：噪声模型只扰动并行时的干扰和 Code prefill，分时下 Conv 被持有，没有噪声。分时策略的轮次间波动以真机为准（V11 → V12：Conv TPOT 1.8%）。
+
+### 18.5 判定
+
+1. **KV 充足时没有碎片**（24 GiB）：`no_move_v2` 与 `kvcached_native` 的 4 个 Code 都在 70s 内出首 token，`kvcached_native` 全部完成、不截断。
+2. **KV 充足时收益来自分时**（24 GiB）：`no_move_v2` → `ca_full_tm_slo` 的 Code TTFT 降 ≥ 40%，Conv TPOT 降 ≥ 15%。
+3. **更重负载下的整体**（λ=0.14）：`no_move_v2` 至少 2 个 Code 的 TTFT > 70s；`no_move_v2` → `ca_full_tm_slo` 的 Code TTFT 降 ≥ 60%，Conv TPOT 退化 ≤ 20%。
+4. **分时下的 B**（λ=0.14）：`mig_random_tm_v2` → `ca_full_tm_v2` 的 Conv TPOT 配对 CI 上界 < 0。这是继 seed 911、914 之后的第三个 trace。
+5. **抢占**（λ=0.14，不分时）：`ca_full_v2` 的抢占次数少于 `mig_random_v2`。
+6. **增长余量**（λ=0.14，不分时）：如实报告。若 `ca_full_v2_nh` 有抢占而 `ca_full_v2` 没有，记为"更重负载下余量防止了抢占"；否则维持负结果。
+7. **正确性**：输出长度精确，迁移全部逐字节校验通过。
+- 块级页模型的样本外误差（Code TTFT、Conv TPOT、迁移数、抢占）如实报告。
+
+### 18.6 事后补充：随机策略的预测区间（V13 第八轮之后写，不改变 §18.4 与 §18.5）
+
+- §18.4 的预测只改变干扰与 prefill 噪声，随机迁移的准入随机种子固定，所以随机策略的区间偏窄（`mig_random_v2` 的抢占预测 17.4 [8.9, 28.7]，真机 2 次）。
+- `sim/predict.py --vary-admission-seed` 同时改变准入种子；用相同的策略顺序重做后，`mig_random_v2` 的抢占为 17.4 [1.0, 34.2]，分时下的 B 为 −6.8% [−10.3, −4.5]（原为退化的 −6.0%）；代价感知策略的预测不变。
+- 判定仍按 §18.5，用原预注册预测计算样本外误差；这里的区间只用于解释偏差。以后对随机策略的预注册预测都加这个选项。

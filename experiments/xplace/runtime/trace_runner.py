@@ -12,7 +12,7 @@ from controller import GIB
 from cost_model import StepModel
 from engine import save, stream
 from fairness import FairAdmissionGate
-from planner import DEFAULT_PARAMS, build_state, plan_admission, plan_return
+from planner import DEFAULT_PARAMS, build_state, conv_growth_tokens, plan_admission, plan_return
 
 POLICIES = {
     "no_move": {"tag": "nm", "admission": None, "return": False, "fair": False},
@@ -28,10 +28,15 @@ POLICIES = {
     "ca_full_tm": {"tag": "ct", "admission": "ca", "return": True, "fair": False, "isolate": True},
     # v2: Conv admission without waiting on the Code tenant (cached Code view); TM holds Conv before admitting Code
     "no_move_v2": {"tag": "n2", "admission": None, "return": False, "fair": False, "fast": True},
+    "no_move_fair_v2": {"tag": "f2", "admission": None, "return": False, "fair": True, "fast": True},
     "mig_random_v2": {"tag": "m2", "admission": "mig_random", "return": False, "fair": False, "fast": True},
+    "ca_admit_v2": {"tag": "a2", "admission": "ca", "return": False, "fair": False, "fast": True},
+    "ca_return_v2": {"tag": "r2", "admission": "mig_random", "return": True, "fair": False, "fast": True},
     "ca_full_v2": {"tag": "c2", "admission": "ca", "return": True, "fair": False, "fast": True},
     "no_move_tm_v2": {"tag": "u2", "admission": None, "return": False, "fair": False, "isolate": True, "fast": True,
                       "hold_first": True},
+    "mig_random_tm_v2": {"tag": "w2", "admission": "mig_random", "return": False, "fair": False, "isolate": True,
+                         "fast": True, "hold_first": True},
     "ca_full_tm_v2": {"tag": "t2", "admission": "ca", "return": True, "fair": False, "isolate": True, "fast": True,
                       "hold_first": True},
     # v3: sliced TM. After `slice[0]` s of Conv hold while a Code prefills, pause the Code (vLLM keep-pause) and let
@@ -43,6 +48,15 @@ POLICIES = {
     # v3.1: SLO-aware slicing -- slice only when a held Conv request waits >= 2 s for its first token, or after 15 s
     "ca_full_tm_slo": {"tag": "sl", "admission": "ca", "return": True, "fair": False, "isolate": True, "fast": True,
                        "hold_first": True, "slice": (2.0, 1.0, 15.0)},
+    # ablation (current-length setting): placement without growth headroom
+    "ca_full_tm_slo_nh": {"tag": "sn", "admission": "ca", "return": True, "fair": False, "isolate": True, "fast": True,
+                          "hold_first": True, "slice": (2.0, 1.0, 15.0), "no_headroom": True},
+    "ca_full_v2_nh": {"tag": "cn", "admission": "ca", "return": True, "fair": False, "fast": True,
+                      "no_headroom": True},
+    # baseline: kvcached as deployed -- both vLLMs serve concurrently with stock admission (KV grows per step,
+    # recompute preemption on shortage) and stock DP load balancing; no controller admission, migration or pausing.
+    # main.py trims each GPU's free memory so the shared KV capacity equals the controlled budget.
+    "kvcached_native": {"tag": "kn", "admission": None, "return": False, "fair": False, "native": True},
 }
 HEAVY_KEYS = ("observations", "plan", "pause_receipts", "transfer_memory")
 
@@ -56,7 +70,7 @@ def light(report):
     plan = report.get("plan") or {}
     record["plan_summary"] = {key: plan.get(key) for key in ("target", "ordering", "objective_s", "performance_cost_s",
                                                             "migration_cost_s", "reason", "accepted", "chosen",
-                                                            "candidates_evaluated", "horizon_steps")}
+                                                            "candidates_evaluated", "horizon_steps", "diagnostics")}
     record["planned_moves"] = [{key: move[key] for key in ("id", "model", "source", "destination", "blocks")}
                                for move in plan.get("moves", [])]
     receipts = report.get("pause_receipts")
@@ -133,7 +147,18 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     journal = Journal(root)
-    await wait_empty(controller)
+    idle = await wait_empty(controller)
+    native = bool(spec.get("native"))
+    kv_mode = "native" if native else getattr(args, "kv_mode", "full")
+    reserve_extra = getattr(args, "reserve_extra_tokens", 0) if kv_mode == "prompt" else 0
+    # Only the legacy full reservation lets the controller enforce the budget; otherwise KV grows per step under the
+    # physical cap (ballast) and a shortage retracts requests inside vLLM.
+    controller.enforce_budget = kv_mode == "full"
+    await controller.set_mode(kv_mode, reserve_extra)
+    preemptions_start = [sum(rank.get("preemptions_total", 0) for rank in ranks) for ranks in idle]
+    recompute_start = [sum(rank.get("recompute_tokens_total", 0) for rank in ranks) for ranks in idle]
+    observed = {"rank": {}, "preemptions": {}, "max_mapped_gib": [0.0] * controller.num_ranks,
+                "capacity_min_gib": [math.inf] * controller.num_ranks}
     controller.events.clear()
     controller.transactions.clear()
     controller.holds.clear()
@@ -145,6 +170,7 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
     origin = time.monotonic() + 1.0
     total = len(trace["requests"])
     pending, results, decisions, tasks, errors = [[], []], [], [], [], []
+    entries = {}  # trace request_id -> entry (incl. live progress), for censored partial records
     code_arrivals, version = [], {"value": 0}
     resident = {"code": 0}
     slices = []
@@ -157,7 +183,39 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
     save(root / "workload.json", {"policy": policy, "origin": origin, "budgets_gib": controller.budgets,
                                   "num_ranks": controller.num_ranks, "planner_params": params,
                                   "step_params": args.step_params, "trace_sha256": args.trace_sha256,
-                                  "requests": total, "duration_s": trace["duration_s"]})
+                                  "requests": total, "duration_s": trace["duration_s"], "native": native,
+                                  "kv_mode": kv_mode, "reserve_extra_tokens": reserve_extra})
+
+    def admission_tokens(mark):
+        """KV the controller admits a request with: the legacy run uses the replayed output length (an oracle);
+        current-length admission uses only the prompt plus the scheduler's fixed reservation extra."""
+        if kv_mode == "full":
+            return mark["prompt_tokens"] + mark["output_tokens"]
+        return mark["prompt_tokens"] + reserve_extra
+
+    def growth_gib(observations, arrival_prompt=None):
+        """Per-request growth allowance (Code, Conv) in GiB; zero under the legacy full reservation."""
+        if kv_mode == "full" or spec.get("no_headroom"):
+            return (0.0, 0.0)
+        conv = observations[1]
+        counts = [len(rank["requests"]) for rank in conv]
+        contexts = [sum(request["computed_tokens"] for request in rank["requests"]) for rank in conv]
+        tokens = conv_growth_tokens(step_model, params, counts, contexts, arrival_prompt, isolate, spec.get("slice"))
+        per_token = conv[0]["block_bytes"] / conv[0]["block_size"] / GIB
+        return (0.0, tokens * per_token)
+
+    def slack_gib(observations):
+        if kv_mode == "full" or spec.get("no_headroom"):
+            return 0.0
+        return params["slack_pages"] * observations[1][0]["page_bytes"] / GIB
+
+    def code_headroom(observations, arrival_prompt):
+        """Per-rank headroom for placing a Code: growth of the Conv residents of that rank plus slack."""
+        if kv_mode == "full" or spec.get("no_headroom"):
+            return [0.0] * controller.num_ranks
+        growth = growth_gib(observations, arrival_prompt)[1]
+        return [len(observations[1][rank]["requests"]) * growth + slack_gib(observations)
+                for rank in range(controller.num_ranks)]
 
     def fail(error):
         errors.append(f"{type(error).__name__}: {error}")
@@ -182,10 +240,20 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
         await asyncio.sleep(max(0.0, arrived - time.monotonic()))
         entry = {"mark": mark, "id": f"{spec['tag']}_{mark['request_id'].replace('-', '_')}", "arrived_at": arrived,
                  "dispatch_lag_s": time.monotonic() - arrived, "blocked_version": None, "last_attempt": 0.0,
-                 "plan_not_before": 0.0}
-        pending[mark["model"]].append(entry)
+                 "plan_not_before": 0.0, "live": {}}
+        entries[mark["request_id"]] = entry
         if mark["model"] == 0:
             code_arrivals.append(arrived)
+        if native:
+            entry["path"] = "native"
+            entry["reservation"] = asyncio.get_running_loop().create_future()
+            entry["reservation"].set_result({"reservation_pending": False, "reserved_at": None})
+            task = asyncio.create_task(stream(engines[mark["model"]], entry["id"], prompts[mark["prompt_key"]],
+                                              mark["output_tokens"], None, mark["model"], "trace", arrived,
+                                              progress=entry["live"]))
+            tasks.extend([task, asyncio.create_task(complete(entry, task))])
+            return
+        pending[mark["model"]].append(entry)
 
     async def complete(entry, task):
         try:
@@ -194,7 +262,13 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
             mark = entry["mark"]
             result.update({"trace_request_id": mark["request_id"], "arrival_s": mark["arrival_s"],
                            "prompt_key": mark.get("prompt_key"), "dispatch_lag_s": entry["dispatch_lag_s"],
-                           "reserved_at": reservation.get("reserved_at"), "admission_path": entry.get("path")})
+                           "reserved_at": reservation.get("reserved_at"), "admission_path": entry.get("path"),
+                           "preemptions": observed["preemptions"].get(entry["id"], 0)})
+            if native:
+                # No controller admission: the request is resident from the moment vLLM receives it, so queueing,
+                # chunk waits and preemption inside vLLM all count in the prefill window and TTFT.
+                result["reserved_at"] = result["submitted_at"]
+                result["rank_initial"] = observed["rank"].get(entry["id"])
             results.append(result)
             journal.write("requests", result)
             version["value"] += 1
@@ -207,6 +281,8 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
                 return_wakeup.set()
             if len(results) == total:
                 done.set()
+        except asyncio.CancelledError:
+            raise  # deliberate cancellation (trial end or censoring), not a failure
         except BaseException as error:
             fail(error)
             raise
@@ -221,6 +297,8 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
                     release_fairness(entry, state)
                     return
                 await asyncio.sleep(.2)
+        except asyncio.CancelledError:
+            raise
         except BaseException as error:
             fail(error)
             raise
@@ -231,7 +309,8 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
             entry["reservation"] = asyncio.get_running_loop().create_future()
             entry["path"] = path
             task = asyncio.create_task(stream(engines[mark["model"]], entry["id"], prompts[mark["prompt_key"]],
-                                              mark["output_tokens"], rank, mark["model"], "trace", entry["arrived_at"]))
+                                              mark["output_tokens"], rank, mark["model"], "trace", entry["arrived_at"],
+                                              progress=entry["live"]))
             tasks.extend([task, asyncio.create_task(complete(entry, task))])
             if mark["model"] == 0 and isolate:
                 # Runs once the controller lock (held by the caller) is released.
@@ -257,31 +336,30 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
 
     async def try_migration(entry, report):
         mark = entry["mark"]
-        tokens = mark["prompt_tokens"] + mark["output_tokens"]
+        tokens = admission_tokens(mark)
         observations = report["observations"]
         geometry = observations[mark["model"]][0]
         need = math.ceil(tokens / geometry["block_size"]) * geometry["block_bytes"] / GIB
         if need < params["migrate_min_gib"] or sum(controller.budgets) - sum(report["used_gib"]) < need:
             return False
-        arrival = {"model": mark["model"], "tokens": tokens, "prompt_tokens": mark["prompt_tokens"],
-                   "output_tokens": mark["output_tokens"]}
+        arrival = {"model": mark["model"], "tokens": tokens, "prompt_tokens": mark["prompt_tokens"]}
         seed = stable_seed(args.seed, mark["request_id"])
 
         def plan_fn(observed):
-            return plan_admission(build_state(observed, controller.budgets), arrival, spec["admission"],
-                                  step_model, params, seed)
+            state = build_state(observed, controller.budgets, growth_gib(observed, mark["prompt_tokens"]),
+                                slack_gib(observed))
+            return plan_admission(state, arrival, spec["admission"], step_model, params, seed)
 
         preplan = plan_fn(await controller.snapshots())
         if preplan.get("target") is None:
             record({"path": "admission_preplan_infeasible", "plan": preplan, "status": "skipped"}, entry)
             return False
         pause_models = sorted({move["model"] for move in preplan["moves"]})
-        if not all(request["decoding"] for model in pause_models for rank in observations[model]
-                   for request in rank["requests"]):
-            return False
         result = await controller.run_transaction(plan_fn, "admission", admission=arrival,
                                                   admit=make_admit(entry, "migration"), pause_models=pause_models,
-                                                  hold_after=(1,) if isolate else ())
+                                                  hold_after=(1,) if isolate else (),
+                                                  admission_headroom=lambda current: code_headroom(
+                                                      current, mark["prompt_tokens"]))
         record(result, entry)
         return bool(result.get("submitted"))
 
@@ -310,8 +388,11 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
                         async def before_admit():
                             await controller.hold_locked(1)
                     report = await controller.try_direct_admission(
-                        mark["model"], mark["prompt_tokens"] + mark["output_tokens"], make_admit(entry, "direct"),
-                        before_admit=before_admit)
+                        mark["model"], admission_tokens(mark), make_admit(entry, "direct"),
+                        before_admit=before_admit,
+                        headroom=((lambda observations, prompt=mark["prompt_tokens"]: code_headroom(observations,
+                                                                                                    prompt))
+                                  if mark["model"] == 0 else None))
                     if report.get("submitted"):
                         pending[mark["model"]].pop(0)
                         progressed = True
@@ -346,14 +427,17 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
                     continue
                 if any(pending):
                     continue
-                if not conv_imbalanced(await controller.summaries()):
+                summaries = await controller.summaries()
+                if kv_mode != "full" and any(rank["requests"] for rank in summaries[0]):
+                    continue  # no rebalancing while a Code is resident: its prefill slows peer copies, gain is nil
+                if not conv_imbalanced(summaries):
                     continue
                 elapsed = max(1.0, time.monotonic() - origin)
                 rate = (len(code_arrivals) + 1) / (elapsed + 1 / params["code_rate"])
 
                 def plan_fn(observed):
-                    return plan_return(build_state(observed, controller.budgets), step_model,
-                                       dict(params, code_rate=rate))
+                    state = build_state(observed, controller.budgets, growth_gib(observed), slack_gib(observed))
+                    return plan_return(state, step_model, dict(params, code_rate=rate))
 
                 preplan = plan_fn(await controller.snapshots())
                 if not preplan["moves"]:
@@ -472,13 +556,30 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
                 gc_events.append({"t": time.monotonic() - origin, "gen": info.get("generation"),
                                   "s": duration, "collected": info.get("collected")})
 
+    def observe(summaries, used):
+        for ranks in summaries:
+            for index, rank in enumerate(ranks):
+                for request in rank["requests"]:
+                    key = request["id"].rsplit("-", 1)[0]
+                    observed["rank"].setdefault(key, index)
+                    observed["preemptions"][key] = max(observed["preemptions"].get(key, 0),
+                                                       request.get("preemptions", 0))
+        observed["max_mapped_gib"] = [max(seen, value) for seen, value in zip(observed["max_mapped_gib"], used)]
+
     async def monitor():
         try:
+            iteration = 0
             while not done.is_set():
                 epoch = controller.code_epoch
                 summaries = await controller.summaries()
                 controller.offer_code_view(epoch, summaries[0])
-                controller.check_capacity(summaries)
+                observe(summaries, controller.check_capacity(summaries))
+                if kv_mode != "full" and iteration % 12 == 0:
+                    capacity = controller.kv_capacity(await controller.memory(), summaries,
+                                                      getattr(args, "kv_utilization", 0.95))
+                    observed["capacity_min_gib"] = [min(seen, value / GIB) for seen, value
+                                                    in zip(observed["capacity_min_gib"], capacity)]
+                iteration += 1
                 now = time.monotonic()
                 journal.write("population", {
                     "t": now - origin, "completed": len(results), "pending": [len(queue) for queue in pending],
@@ -487,7 +588,8 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
                     "counts": [[len(rank["requests"]) for rank in ranks] for ranks in summaries],
                     "decoding": [[sum(request["decoding"] for request in rank["requests"]) for rank in ranks]
                                  for ranks in summaries],
-                    "mapped_gib": [[rank["mapped_bytes"] / GIB for rank in ranks] for ranks in summaries]})
+                    "mapped_gib": [[rank["mapped_bytes"] / GIB for rank in ranks] for ranks in summaries],
+                    "preemptions": [sum(rank.get("preemptions_total", 0) for rank in ranks) for ranks in summaries]})
                 journal.save(root / "progress.json", {"policy": policy, "elapsed_s": now - origin, "completed": len(results),
                                                "total": total, "moves": len(controller.events),
                                                "pending": [len(queue) for queue in pending]})
@@ -496,6 +598,41 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
             if not isinstance(error, asyncio.CancelledError):
                 fail(error)
             raise
+
+    def censored_records(at):
+        """Partial records of requests not completed by the deadline (same schema as completed ones, flagged).
+
+        A request with no first token gets first_token_at = deadline, so its TTFT is a lower bound; one with >= 2
+        tokens reports its observed per-token time through (last token - first token) / (tokens - 1).
+        """
+        finished = {item["trace_request_id"] for item in results}
+        records = []
+        for mark in trace["requests"]:
+            if mark["request_id"] in finished:
+                continue
+            entry = entries.get(mark["request_id"])
+            live = entry["live"] if entry else {}
+            count = live.get("count") or 0
+            first = live.get("first_token_at")
+            reservation = entry.get("reservation") if entry else None
+            reserved_at = (live.get("submitted_at") if native else
+                           reservation.result().get("reserved_at")
+                           if reservation is not None and reservation.done() and not reservation.cancelled()
+                           else None)
+            first_at = first if first is not None else at
+            records.append({
+                "request_id": entry["id"] if entry else None, "trace_request_id": mark["request_id"],
+                "model": mark["model"], "role": "trace", "censored": True, "censored_at": at,
+                "prompt_tokens": mark["prompt_tokens"], "target_output_tokens": mark["output_tokens"],
+                "output_tokens": count, "arrived_at": entry["arrived_at"] if entry else origin + mark["arrival_s"],
+                "arrival_s": mark["arrival_s"], "submitted_at": live.get("submitted_at"),
+                "first_token_at": first_at, "first_token_observed": first is not None,
+                "completed_at": live.get("last_at") if count >= 2 else first_at, "reserved_at": reserved_at,
+                "admission_path": entry.get("path") if entry else "not_arrived",
+                "max_token_gap_s": live.get("max_gap"), "cadence": list(live.get("cadence") or []),
+                "preemptions": observed["preemptions"].get(entry["id"], 0) if entry else 0,
+                "rank_initial": observed["rank"].get(entry["id"]) if entry else None})
+        return records
 
     arrivals = [asyncio.create_task(submit(mark)) for mark in trace["requests"]]
     loops = [asyncio.create_task(dispatch()), asyncio.create_task(monitor()), asyncio.create_task(loop_lag())]
@@ -507,6 +644,7 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
     watcher = threading.Thread(target=watchdog, name="xplace-loop-watchdog", daemon=True)
     watcher.start()
     gc.callbacks.append(gc_callback)
+    incomplete, censored_at = [], None
     try:
         finished = asyncio.create_task(done.wait())
         broken = asyncio.create_task(failed.wait())
@@ -517,7 +655,10 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
         if errors:
             raise RuntimeError(f"Trial {policy} failed: {errors[0]}")
         if not done.is_set():
-            raise TimeoutError(f"Trial {policy} did not complete within the drain timeout")
+            # Deadline reached without an error: censor (record partial progress, abort in-flight requests below)
+            # so a pathologically slow policy bounds its round instead of failing the whole bundled job.
+            censored_at = time.monotonic()
+            incomplete = censored_records(censored_at)
     finally:
         watchdog_stop.set()
         if gc_callback in gc.callbacks:
@@ -531,15 +672,34 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
         await asyncio.gather(*tasks, return_exceptions=True)
         if controller.held and not errors:
             await controller.set_hold(1, lambda: False)
+        if censored_at is not None:
+            try:
+                await wait_empty(controller, timeout=300)  # aborted requests must leave vLLM before the next trial
+            except Exception as error:
+                errors.append(f"post-censor drain: {type(error).__name__}: {error}")
+        controller.enforce_budget = True
+        try:
+            final = await controller.summaries()
+            preemptions = [sum(rank.get("preemptions_total", 0) for rank in ranks) - start
+                           for ranks, start in zip(final, preemptions_start)]
+            recompute_tokens = [sum(rank.get("recompute_tokens_total", 0) for rank in ranks) - start
+                                for ranks, start in zip(final, recompute_start)]
+        except Exception as error:
+            preemptions = recompute_tokens = f"{type(error).__name__}: {error}"
         journal.close()
         save(root / "requests.json", results)
+        if censored_at is not None:
+            save(root / "incomplete.json", incomplete)
         save(root / "decisions.json", decisions)
         save(root / "migrations.json", controller.events)
         save(root / "transactions.json", controller.transactions)
         save(root / "holds.json", controller.holds)
         save(root / "slices.json", slices)
-        summary = {"policy": policy, "status": "passed" if done.is_set() and not errors else "failed",
+        status = ("passed" if done.is_set() and not errors else
+                  "censored" if censored_at is not None and not errors else "failed")
+        summary = {"policy": policy, "status": status,
                    "errors": errors, "requests": len(results), "expected": total,
+                   "censored": len(incomplete), "censored_at_s": None if censored_at is None else censored_at - origin,
                    "moves": len(controller.events), "transactions": len(controller.transactions),
                    "wall_s": time.monotonic() - started,
                    "control_s": sum(item.get("control_s", 0) for item in controller.transactions),
@@ -547,6 +707,12 @@ async def run_trace(engines, controller, trace, prompts, policy, root, args):
                    "holds": len(controller.holds), "held_s": sum(item.get("held_s", 0) for item in controller.holds),
                    "admission_view": dict(controller.view_stats), "slices": len(slices), "loop_lag": dict(lags),
                    "gc_slow": len(gc_events), "gc_max_s": max((item["s"] for item in gc_events), default=0.0),
-                   "journal_errors": journal.errors}
+                   "journal_errors": journal.errors, "native": native, "kv_mode": kv_mode,
+                   "preemptions": preemptions, "recompute_tokens": recompute_tokens,
+                   "preempted_requests": sum(1 for item in results if item.get("preemptions")),
+                   "max_mapped_gib": observed["max_mapped_gib"],
+                   "capacity_min_gib": [None if math.isinf(value) else value
+                                        for value in observed["capacity_min_gib"]],
+                   "rank_unobserved": sum(1 for item in results if item.get("rank_initial") is None)}
         save(root / "summary.json", summary)
     return summary
