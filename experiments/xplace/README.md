@@ -1,5 +1,7 @@
 # xplace：4 卡跨模型 KV placement campaign
 
+当前EP4TP2续接入口（2026-11-10）：[309147机制观测结果](docs/tp2-observability-results-20261110.md)与[采样等待源码审查/下一次判别协议](docs/tp2-sampling-wait-review-20261110.md)。产物验收已通过，实测代价与独立配对门未通过；本轮不运行分时或混合拓扑。以下较早策略记录不代表当前门槛已完成。
+
 ## 0. 用户 guideline（2026-11-02）
 
 1. 由 Claude 接管 Codex 的进度。数值一致性 debug 不重要，只在等待性能实验时顺手做。
@@ -37,9 +39,10 @@
 | `runtime/` | 上传到集群的运行时。<br>`live_scheduler.py`/`worker.py`/`peer_transfer.py` 由 dp_opt 泛化为 N rank；模块名必须保留，kvcached 补丁按名字 import。<br>`controller.py`（事务与迁移）、`planner.py`（准入/回迁）、`cost_model.py`（步时模型）、`trace_runner.py`（策略驱动）、`calibrate.py`（Job 1 校准）、`fit.py`、`main.py`（入口） |
 | `xplace.sbatch` | 4×A800 作业脚本：SHA 校验 → GPU 检查 → import 自检和单测 → `main.py` |
 | `sim/` | 离线 simulator（与 live 共用 `planner.py`）、live 拟合/验证/预测/扫描（见 §3.1）、RQ4 扫描（`sweep_rq4.py` 负载 × KV 预算，`sweep_slicing.py` 切片参数）、DP=2 验证（`validate_dp2.py`） |
-| `tools/` | `make_trace.py`（冻结 trace，Code 可 Poisson 或固定间隔）、`analyze.py`（指标，live 和 sim 共用）、`report_main.py`（主报告）、`decompose.py`（按 Code 状态拆分 Conv TPOT）、`check_tm.py`（分时/切片检查：holds、Code prefill、持有期间 Conv 是否出 token）、`vs_forecast.py`（实测对预注册预测）、`final_tables.py` / `combine_runs.py`（多作业汇总）、`master_table.py`（论文表 2：多作业、多 seed 的 R1–R14 与单组件对照）、`xplace_ctl.py`（build/upload/submit/status/fetch，支持 `--dependency`/`--exclude`） |
-| `tests/` | 本地和作业启动时运行的 CPU 测试。假 vLLM 引擎（含 chunked prefill、keep-pause）会端到端跑完各阶段；N-rank peer transfer 用多线程模拟 all_gatherv 测试 |
-| `docs/protocol.md` | 实验协议：§6 短作业 campaign，§7 v2，§8 v3，§9 V4，§10 v3.1，§11 V6 公平基线，§12 v3.2，§13 V7 kvcached 原生基线；当前长度设定：§14 V8，§15 V9/V10（页共享、截断、空闲块修复），§16 V11 复现 seed，§17 V12 补齐 seed 914，§18 V13 RQ4 锚点 |
+| `tools/` | `make_trace.py`（冻结 trace，Code 可 Poisson 或固定间隔）、`analyze.py`（指标，live 和 sim 共用）、`report_main.py`（主报告）、`decompose.py`（按 Code 状态拆分 Conv TPOT）、`check_tm.py`（分时/切片检查：holds、Code prefill、持有期间 Conv 是否出 token）、`vs_forecast.py`（实测对预注册预测）、`final_tables.py` / `combine_runs.py`（多作业汇总）、`master_table.py`（论文表 2：多作业、多 seed 的 R1–R21 与单组件对照）、`xplace_ctl.py`（build/upload/submit/status/fetch，支持 `--dependency`/`--exclude`） |
+| `figures/` | 论文图：`make_all.py` 生成 `Paper/figures/` 下 10 张图（PDF/SVG/PNG）。`osdi.py` 为风格，`data.py` 只读 `evidence/` 的归档，`schematic.py` 画示意图 |
+| `tests/` | 本地和作业启动时运行的 CPU 测试。假 vLLM 引擎（含 chunked prefill、keep-pause）会端到端跑完各阶段；N-rank peer transfer 用多线程模拟 all_gatherv 测试；`test_general.py` 测通用版（`*_g`），包括两个实例角色互换 |
+| `docs/protocol.md` | 实验协议：§6 短作业 campaign，§7 v2，§8 v3，§9 V4，§10 v3.1，§11 V6 公平基线，§12 v3.2，§13 V7 kvcached 原生基线；当前长度设定：§14 V8，§15 V9/V10（页共享、截断、空闲块修复），§16 V11 复现 seed，§17 V12 补齐 seed 914，§18 V13 RQ4 锚点，§19 V14 最终方案的逐项消融，§20 V15 不留余量的受控基线 |
 | `reports/results-short.md` | 结果与结论 |
 | `reports/progress.md` | 进度记录（作业、状态、下一步） |
 
@@ -48,7 +51,7 @@
 - **每步代价**：vLLM 开 CUDA graph 时把各 DP rank 补齐到 max token 数，所以每个 tenant 的 decode 每步约为 `base + graph[bucket(max_r n_r)] + c·max_r ctx_r`。另一个 tenant 活跃时还要加跨 tenant 干扰项。
 - **准入（Code 放不下时）**：
   - `mig_random`：随机可行目标，按 KV 最大优先选要移走的请求，目的地随机。
-  - `ca`：枚举目标和 3 种挑选顺序，目的地用贪心避免跨档位，按"剩余工作 × 每步代价 + 暂停/复制代价"选最优方案。
+  - `ca`：枚举目标 rank 和 2 种挑选顺序（KV 降序、升序），目的地用贪心避免跨档位，按"90s 规划窗口内的 decode 时间 + 暂停/复制代价"选最优方案（输出长度未知，所有请求在窗口内都按持续生成计）。
   - 只对 KV ≥ 4 GiB 的请求（Code）走迁移准入。
 - **回迁**（`ca_return`/`ca_full`）：在 Code 完成时触发，之后每 10s 检查一次。把各 rank 的 Conv 计数平整到某一水平，收益要超过迁移代价、headroom 风险和 margin 才执行。
 - **分时**（`*_tm`）：Code 被准入后，Conv tenant 在下一个 32 步边界暂停，最后一个驻留的 Code 完成后恢复（`controller.set_hold`）。原因是两个 EP tenant 同卡并行时都慢 10 倍以上，而暂停期间 vLLM DP engine 完全空闲。
@@ -66,13 +69,28 @@
 ### 3.2 当前长度准入（v4，V8 起）
 
 - **准入**：受控策略只预留 prompt + 256 token（`--kv-mode prompt --reserve-extra-tokens 256`），之后按步增长；KV 不够时由 vLLM 抢占重算（`live_scheduler._preempt_request` 计数）。`kvcached_native` 策略自己把调度器切到 vLLM 原生准入（`kv_mode` 为 native）。planner 和 simulator 都不读输出长度。
-- **增长余量**：`planner.conv_growth_tokens` 按"decode 速率 × 时间窗口"估计 Conv 在 Code 驻留期间的增长，并额外留 1 个页组（`slack_pages`）。速率按调度方式取：分时下为 0，切片时只计切片窗口，并行时按受干扰的速率。`*_nh` 策略不留余量，用作消融。
+- **增长余量**：`planner.conv_growth_tokens` 按"decode 速率 × 时间窗口"估计 Conv 在 Code 驻留期间的增长，并额外留 1 个页组（`slack_pages`）。速率按调度方式取：分时下为 0，切片时只计切片窗口，并行时按受干扰的速率。另有"单独速率 15s"的下限（`relief_horizon_s`）：`relief_scope: "all"`（V8–V14）对所有增长的 rank 生效，`"destinations"`（v4.4，`planner-params-v4.json`，V15 起）只对接收迁移的 rank 生效，Code 自己的 rank 只留驻留期间的增长（`build_state(..., target_growth_gib)`）。`*_nh` 策略不留余量：`ca_*_nh` 用作消融，`no_move_v2_nh`、`no_move_tm_slo_nh` 是 V15 起的受控基线。
 - **容量对齐**：每轮开始前用占位把每卡的物理容量压到 170 个 96 MiB 页组（15.94 GiB），控制器预算同步设为这个值；轮次结束后释放。
 - **页共享**：按步增长时，kvcached 把同一 rank 上各 Conv 的块交错放进同一批页里。只迁走少数 Conv 腾不出整页，准入往往要迁走目标 rank 上的大部分 Conv（V10 中位 9 个，最多 13 个），所以 `max_moves` 提到 24（`planner-params-v3`）。planner 按快照中的页归属，只计入所有者全部被迁走的页。
 - **物理空闲块**：kvcached 报告的 `free_blocks` 是物理空闲。planner 判断 Code 能否放进时，计入计划迁出后会释放的块（v4.3）；不可行时把每个目标 rank 的诊断写进 decisions。
 - **控制器侧排队**：原生 vLLM DP 下，被 KV 挡住的请求会让整个 DP 组持续执行 dummy batch，拖慢共址的另一个模型。受控策略在控制器里排队，放得下才交给 vLLM。
 - **截断**：一轮到截止时间（trace + 1000s）时记录部分进度（`incomplete.json`，未出首 token 的 TTFT 记下界），abort 后继续下一轮。
 - **有 Code 驻留时不回迁**，避免在 Code prefill 期间做慢迁移。
+
+### 3.3 通用版（`*_g`，11-06 实现，未上真机）
+
+- **规则**：所有决策都不看请求属于哪类请求（用户 11-06）。设计与验证见 [Paper/design.md](../../../Paper/design.md) §5、§10。
+- **代码名**：每个受控策略都有通用版，名为"原名 + `_g`"（本文为 `ca_full_tm_slo_g`），参数为 `planner-params-v5.json`。旧版策略不变，用来重现 V10–V15。
+- **与旧版的差别**：
+  - 每次准入都按逐请求的增长留余量；
+  - 任何被碎片挡住的请求都可以迁移准入，可迁任何实例中正在 decode 的请求；
+  - 分时由 prefill 的收益 TM_GAIN 触发，首 token 后再过 2 s 结束；
+  - 回迁覆盖所有实例，风险按到达需求分布估计；
+  - 快路径只在缓存视图精确时使用。
+- **simulator**：
+  - chunked prefill 改为按 prompt 长度判断（> 4096 token），不再按实例；
+  - 21 个旧策略在 V15 的 3 个 trace 上输出逐位不变；
+  - 本地测试 `sim/test_general_sim.py`。
 
 ## 3.1 simulator（`sim/`）
 
@@ -102,37 +120,71 @@ python3 tools/xplace_ctl.py fetch <tag> <job>
 - 一个作业跑多个 trace / KV 上限：`XPLACE_SEGMENTS=<segments.json>`（`main.py --segments`，文件放进 inputs），内容为 `{"segments": [{"label", "trace", "budget_cap_gib", "policies"}]}`，按顺序运行，输出到 `trace/<label>/<policy>`；所有 segment 的 trace 和策略名在第一轮之前检查。
 - 远端目录：`~/run/kvcached-paracloud/xplace/<tag>/{upload,job-<id>,logs}`，upload 只读、不可变。
 - 本地证据：`evidence/xplace-<tag>/`。
-- 本地测试：`/tmp/xplace-venv/bin/python -m pytest -q -p no:cacheprovider tests/`（需要 torch 的测试在无 torch 时自动跳过）。
+- 本地测试：`/tmp/xplace-venv/bin/python -m pytest -q -p no:cacheprovider tests/`。测试环境必须可导入 torch；peer-transfer 的 CPU 张量/逐 TP lane 测试不可跳过，缺依赖时收集失败。提交前还须在新 staging 的 upload 目录运行同套测试，不能用无 torch 的结果代替。
 - 报告：`python3 tools/report_main.py <job>/out/trace --end-s <duration>`（A/B/消融表、配对 bootstrap、按 Code 状态拆分 Conv TPOT）。
 - 自写分析脚本注意：`migrations.json` 里的 `request_id` 是 vLLM 内部 ID，形如 `<控制器 ID>-<8 位后缀>`，与 `requests.json` 对齐时要先去掉后缀。
 
-## 5. 当前结论（2026-11-05，V10–V13 之后，当前长度准入）
+## 5. 当前结论
 
-单节点、两个 seed，三个作业：seed 911 为 V10（14 个策略）；seed 914 为 V11（8 个）和 V12（9 个，其中 3 个与 V11 重复）。各作业内配对，Code n=4，Conv n=58 / 54。两个 seed 的总表 R1–R14 见 results-short §12.8。V13 在两个偏离工作点的位置（λ=0.14、16 GiB；24 GiB）做了真机锚点，四列总表见 §12.9。
+### 5.0 通用版（V16，2026-11-07，论文的方法）
 
-- **最终推荐 `ca_full_tm_slo`**：
-  - 对控制器基线 `no_move_v2`：Code TTFT −88.5% / −92.9%，Conv TPOT −4.6% / +2.2%（都在 20% 内），Conv SLO 1.00，0 次抢占；
+- **设定**：
+  - 通用版 `ca_full_tm_slo_g`（R12g）及其逐项消融，所有决策都不看请求类别；
+  - V16 = 295488，20 轮全部 passed，两个 seed 外加 λ=0.14 的锚点；
+  - 结果见 results-short §12.12，总表为 `master-table-v16-general.md`。
+- **对不留余量的受控基线 R20g**（seed 914 / 911 / λ=0.14）：
+  - Code TTFT −88.8% / −81.6% / −95.3%；
+  - Conv TPOT −3.5% / −19.0% / +2.8%；
+  - Conv SLO 1.00 / 1.00 / 0.98，0 次抢占。
+- **对 kvcached 原生**（跨作业，原生截断）：Code TTFT 至少降 95%，Conv TPOT −90%。
+- **消融**（→ R12g，seed 914 / 911）：
+
+  | 组件 | Code TTFT | Conv TPOT | 其他 |
+  |---|---|---|---|
+  | 迁移（R21g） | −84.0% / −86.5% | +8.3% / +12.7% | |
+  | 代价感知 placement（R16g） | | −8.6% / −4.6% | |
+  | 回迁（R17g） | | −8.2% / −3.7% | |
+  | 代价感知准入（R18g） | | +1.1% / −0.4% | |
+  | 分时（R7g） | −45.3% / −53.5% | −17.5% / −29.3% | |
+  | 按需切片（R10g） | +23% | | Conv TTFT p99 24–26 → 3.7 s |
+  | 增长余量（R14g） | | | 没有作用 |
+
+- **通用规则在本负载上与旧版的决策一致**：
+  - 分时只在 Code 实例上，每个 Code 一个 episode；
+  - 迁移准入只由 Code 触发；
+  - R12g 与旧版 R12 的 9 次跨作业比较差别在 4% 以内。
+
+### 5.1 旧版（V10–V15，按类别区分，只作参考）
+
+单节点、两个 seed：seed 911 为 V10（14 个策略）；seed 914 为 V11（8 个）和 V12（9 个，其中 3 个与 V11 重复）。各作业内配对，Code n=4，Conv n=58 / 54。两个 seed 的总表 R1–R14 见 results-short §12.8。V13 在两个偏离工作点的位置（λ=0.14、16 GiB；24 GiB）做了真机锚点，四列总表见 §12.9。V14 在两个 seed 上对最终方案逐项消融（R15–R19，§12.10）。V15 补了不留余量的受控基线（R20、R21，§12.11）。
+
+- **最终推荐 `ca_full_tm_slo`**（V15 起余量规则 v4.4：15s 下限只用于迁移目的地）：
+  - 对不留余量的受控基线 `no_move_v2_nh`（原生准入语义 + 控制器侧排队）：Code TTFT −81.5% / −89.5% / −95.4%（seed 911 / 914 / λ=0.14），Conv TPOT −19.4% / +1.0% / +12.6%（都在 20% 内），Conv SLO 0.98–1.00，0 次抢占；
+  - 对留余量的旧受控基线 `no_move_v2`：Code TTFT −88.5% / −92.9%，Conv TPOT −4.6% / +2.2%。旧基线在 Code 直接准入时也留了 0.7–0.9 GiB/rank 的增长余量，会多挡住一些 Code（用户 11-06 指出，V15 验证），所以主基线改为不留余量的版本；
   - 对 kvcached 原生：原生下 2 / 3 个 Code 到 1900s 都没开始（截断，TTFT 记下界），Code TTFT 至少降 95%，Conv TPOT −90%。
 - **问题**：按当前长度，后到的 Code 在每张 rank 上都放不进。
   - 原生 vLLM DP 下，被挡住的请求让 Code 实例持续执行 dummy batch，把 Conv 拖到 300–330ms/token；
   - 控制器侧排队可以避免这一点，但被挡的 Code 仍要在控制器里等 378–542s。
-- **A（迁移）**：迁走目标 rank 上的大部分 Conv 后，Code 排队降到约 1s。Code TTFT 在并行下 −76% / −87%，分时下 −87% / −89%。
+- **A（迁移）**：迁走目标 rank 上的大部分 Conv 后，Code 排队降到约 1s。Code TTFT 在并行下 −76% / −87%，分时下 −87% / −89%（旧基线留余量）；最终调度下对不留余量的不迁移基线 −85.4% / −87.4%，Conv TPOT 代价 +13.5% / +12.3%（V15）。
   - 并行下 Conv TPOT +39% / +47%，超出 20%；
   - 分时把它降回来：在不迁移、随机、代价感知三种 placement 上，Conv TPOT 在 seed 911 上为 −15%、−24%、−30%，在 seed 914 上为 −8%、−24%、−29%。
+  - 余量在并行基线上是用 Code TTFT 换 Conv TPOT：去掉余量后更多 Code 在窗口内与 Conv 并行，Code TTFT −34~−38%，Conv TPOT +4~+21%。
 - **B（代价感知 placement）**：
   - 分时下稳定：−11.6% / −10.4%（两个 trace）；分时下同一策略两次运行只差 1.8%。
   - 不分时下小且随运行变化：三次独立配对 −4.3%、−4.6%、−2.0%，方向一致；随机迁移自身两次运行差 4.4%，与 B 同量级。请求级 bootstrap CI 不含轮次间波动。
-  - 来源是持续控制失衡：有代价感知回迁的 21 轮（V10–V13），无 Code 时段各 rank Conv 数之差都在 1.3–2.5；迁移但不回迁的 9 轮（随机，或只做代价感知准入）为 2.8–7.0，取决于这一轮迁到了哪里。B 的大小就是随机迁移那一轮多留下的失衡，所以准入与回迁各自的份额在各轮之间不稳定（V12 判定 1、2 因此不成立）。
-  - 抢占（V10–V13）：完整设计（回迁 + 增长余量）16 轮共 0 次；去掉余量的 5 轮中只有 λ=0.14 不分时那一轮有 2 次；不回迁的 9 轮中 5 轮出现抢占，共 22 次，最满 rank 的 Conv 映射达到 15.66–15.84 GiB（上限 15.94 GiB）。
+  - 来源是持续控制失衡：有代价感知回迁的 27 轮（V10–V14），无 Code 时段各 rank Conv 数之差都在 1.3–2.5；迁移但不回迁的 13 轮（随机，或只做代价感知准入）为 2.8–7.0，取决于这一轮迁到了哪里。B 的大小就是随机迁移那一轮多留下的失衡，所以准入与回迁各自的份额在各轮之间不稳定（V12 判定 1、2 因此不成立）。
+  - 最终调度（分时 + 按需切片，V14）下：B 为 −10.2% / −10.8%；去掉回迁 −3.5% / −6.4%，去掉代价感知准入 −3.3% / −1.4%；单独做任一个都拿到 B 的大部分（−4.7% 到 −9.6%）。代价感知准入的作用来自第二次迁移准入复用上一个 Code 腾空的 rank（只迁 1–5 个 Conv；随机准入换一张 rank、迁 11–13 个）。
+  - 抢占（V10–V14）：有回迁和增长余量的 22 轮共 0 次；去掉余量的 5 轮中只有 λ=0.14 不分时那一轮有 2 次；不回迁的 13 轮中 6 轮出现抢占，共 32 次，最满 rank 的 Conv 映射达到 15.66–15.84 GiB（上限 15.94 GiB）。
   - 来源不在 CUDA graph 档位：每 rank 超过 8 个 Conv，G16 不可避免；在最满 rank 的 batch 和 attention 长度。
 - **负结果**：
   - 增长余量（准入时为 Conv 增长多留空间）在 λ=0.12（两个 seed、两种调度）下没有作用：四次对比都没有抢占，Conv TPOT 差别 ≤3.3%、方向不一；为增长留空间主要靠持续回迁。只有在更重的不分时负载下（λ=0.14，V13）余量起了作用：不留余量 2 次抢占、留余量 0 次，代价是 Conv TPOT +1.0%（n=1）。分时下 Conv 被持有、不增长，余量不需要；
   - 公平门不能解决单卡放不下，Conv TTFT 75.5s / 144.5s；
-  - 按页挑选迁移对象不比按 KV 挑选省迁移（模拟），代价感知准入没有作用是页共享造成的结构性结果。
+  - 按页挑选迁移对象不比按 KV 挑选省迁移（模拟）；第一次迁移准入时代价感知准入与随机迁移选同一张 rank、迁同样多，是页共享造成的结构性结果（第二次准入见上）。
+- **v2 控制面**（V14，对 v1）：Code TTFT 在两个 seed 上都没有显著差别（+1.3%、+0.9%），先停 Conv 在分时下只省约 1s 的重叠；作用在 Conv TTFT 的尾部：v1 下在 Code 准入进行中到达的 Conv 要等 4.6–5.1s 才被准入（v2 为 0.04–0.22s），seed 914 上 v1 的 Conv SLO 0.91、TTFT p99 7.0s（v2 1.00、3.7s）。
 - **RQ4（模拟 + 真机锚点）**：碎片和原生的崩溃都随 KV 预算增大而消失，分时的收益不变；按需切片优于所有周期切片（results-short §12.7）。
   - 24 GiB：Code 全部直接准入，原生与受控基线相同，本文策略的收益全部来自分时（Code TTFT −52.5%，Conv TPOT −26.1%）；本文策略在 16 GiB 下的性能与 24 GiB 下几乎相同。
   - λ=0.14：受控基线 4 个 Code 全部被挡；本文策略 Code TTFT −95.3%，Conv TPOT +0.5%；B 在第三个 trace 上复现（分时 −4.9%，不分时 −6.1%）。
-  - 块级页模型的样本外误差：V12 上 Code TTFT 3.1%、Conv TPOT 1.8%；V13 上 3.6%、2.6%（受控基线在 λ=0.14 下偏差最大，阈值效应）。
+  - 块级页模型的样本外误差：V12 上 Code TTFT 3.1%、Conv TPOT 1.8%；V13 上 3.6%、2.6%；V14 上 8.1%、1.8%，除去一轮阈值效应（seed 914 不迁移变体，+70.6%）为 2.4%（受控基线类策略在阈值附近偏差最大）。V14 中 simulator 低估了分时下的 B 和随机迁移的抢占。V15 上最终方案 0.3%、1.5%，不留余量的并行基线有两轮阈值偏差（−41.8%、+14.9%）。
 - **全量预留下的旧结论（V1–V7）只作历史参考**：当时 Conv 预留的输出空间约为实际的两倍，与原生相比迁移没有 A 收益。
 
-完整结论与表格见 [reports/results-short.md](reports/results-short.md) §12，协议见 [docs/protocol.md](docs/protocol.md) §14–§18，状态见 [reports/progress.md](reports/progress.md)。
+完整结论与表格见 [reports/results-short.md](reports/results-short.md) §12，协议见 [docs/protocol.md](docs/protocol.md) §14–§20，状态见 [reports/progress.md](reports/progress.md)。

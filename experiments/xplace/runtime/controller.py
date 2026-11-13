@@ -54,6 +54,7 @@ class PlacementController:
             raise ValueError("Controller needs two tenants and one budget per DP rank")
         self.engines = engines
         self.num_ranks = num_ranks
+        self.tensor_parallel_size = 1
         self.budgets = [float(value) for value in budgets_gib]
         self.lock = asyncio.Lock()
         self.events = []
@@ -68,6 +69,14 @@ class PlacementController:
         self.code_view = None
         self.code_epoch = 0
         self.view_stats = {"cached": 0, "fetched": 0}
+        # General policies (*_g): a per-tenant cached view serves another tenant's admission only while it is exact
+        # (view_exact): the tenant was held since the view, or none of its requests can outgrow its reservation
+        # within the view's age (e.g. a long prefill). Admissions of a tenant bump its epoch under self.lock.
+        self.general = False
+        self.views = {}
+        self.view_epoch = [0, 0]
+        self.max_decode_rate = 100.0  # tokens/s bound on one request's decode (set from the step model)
+        self.min_prefill_s_per_token = 0.0  # fastest prefill (alone), set from the step model
         # Native runs cap KV physically (ballast) instead of through admission, so the budget is observed, not enforced.
         self.enforce_budget = True
 
@@ -77,6 +86,8 @@ class PlacementController:
 
     async def admission_view(self, model):
         """Summaries used to admit a `model` request (call under self.lock)."""
+        if self.general:
+            return await self.general_view(model)
         if not (self.fast_admission and model == 1):
             observations = await self.summaries()
             if self.fast_admission:
@@ -103,6 +114,74 @@ class PlacementController:
         if self.fast_admission and epoch == self.code_epoch:
             self.code_view = view
 
+    async def general_view(self, model):
+        """General policies: `model` live; each other tenant from its cached view while exact (fast admission),
+        else live. Call under self.lock, so no admission changes a view meanwhile."""
+        observations = [None, None]
+        others = [other for other in (0, 1) if other != model]
+        # read cached views before awaiting: a completion may drop a view meanwhile
+        cached = {other: self.views[other]["summaries"] for other in others
+                  if self.fast_admission and self.view_exact(other)}
+        live = [model] + [other for other in others if other not in cached]
+        started = time.monotonic()
+        for item, value in zip(live, await asyncio.gather(*[self.tenant_summaries(item) for item in live])):
+            observations[item] = value
+            self.views[item] = {"at": started, "summaries": value}
+        for other in others:
+            if other in cached:
+                observations[other] = cached[other]
+                self.view_stats["cached"] += 1
+            else:
+                self.view_stats["fetched"] += 1
+        return observations
+
+    def view_exact(self, model):
+        """True if `model`'s cached view still bounds its KV: held since the view was taken, or no request in it can
+        allocate past its reservation within the view's age -- a request must first finish its prefill (at most at
+        the solo prefill speed) and then decode through the reservation's spare tokens (at most max_decode_rate)."""
+        view = self.views.get(model)
+        if view is None:
+            return False
+        hold = self.held.get(model)
+        if hold is not None and hold["paused_at"] <= view["at"]:
+            return True
+        age = time.monotonic() - view["at"]
+        for rank in view["summaries"]:
+            for request in rank["requests"]:
+                prompt, computed = request["prompt_tokens"], request["computed_tokens"]
+                prefill_s = max(0, prompt - computed) * self.min_prefill_s_per_token
+                spare = max(0, request["reservation_tokens"] - max(computed, prompt))
+                if age > prefill_s + spare / self.max_decode_rate:
+                    return False
+        return True
+
+    def begin_change(self, model):
+        """Call under self.lock before `model`'s KV may grow through an admission (Code only in legacy policies)."""
+        if self.general:
+            self.view_epoch[model] += 1
+            self.views.pop(model, None)
+        elif model == 0:
+            self.begin_code_change()
+
+    def end_change(self, model, view=None, at=None):
+        """Call under self.lock once the admission's reservation is in place; `view` is the tenant's state now."""
+        if self.general:
+            self.view_epoch[model] += 1
+            if view is not None:
+                self.views[model] = {"at": time.monotonic() if at is None else at, "summaries": view}
+        elif model == 0:
+            self.end_code_change(view)
+
+    def offer_view(self, model, epoch, view, at):
+        """General policies: a monitor refresh begun at `at`, kept only if no admission changed `model` since."""
+        if epoch == self.view_epoch[model]:
+            self.views[model] = {"at": at, "summaries": view}
+
+    def drop_views(self, models):
+        for model in models:
+            self.view_epoch[model] += 1
+            self.views.pop(model, None)
+
     async def call(self, model, rank, method, *args):
         client = self.engines[model].engine_core
         return await asyncio.wait_for(client._call_utility_async(method, *args, engine=client.core_engines[rank]),
@@ -119,12 +198,28 @@ class PlacementController:
     async def summaries(self):
         return await self.gather("placement_summary")
 
+    async def prediction_observations(self, root, timeout_s):
+        from live_observation import collect_execution, collect_scheduler
+        from observation_diagnostics import gather_drained
+
+        scheduler, execution = await gather_drained(
+            collect_scheduler(self, timeout_s),
+            collect_execution(root, self.num_ranks, self.tensor_parallel_size, timeout_s))
+        return {"scheduler": scheduler, "execution": execution, "collected_at": time.monotonic(),
+                "forecast_status": "unavailable_not_estimated", "device_activity": "unknown"}
+
     async def memory(self, release_unused=False, models=(0, 1)):
         values = await asyncio.gather(*[self.call(model, rank, "collective_rpc", "placement_memory_snapshot", 120,
                                                   (release_unused,), {})
                                         for model in models for rank in range(self.num_ranks)])
-        return {model: list(values[index * self.num_ranks:(index + 1) * self.num_ranks])
-                for index, model in enumerate(models)}
+        memory = {model: list(values[index * self.num_ranks:(index + 1) * self.num_ranks])
+                  for index, model in enumerate(models)}
+        if self.tensor_parallel_size > 1:
+            from tp_migration import ordered_shards
+
+            memory = {model: [ordered_shards(group, self.tensor_parallel_size, rank)
+                              for rank, group in enumerate(groups)] for model, groups in memory.items()}
+        return memory
 
     def check_capacity(self, observations):
         used = used_gib(observations)
@@ -137,16 +232,24 @@ class PlacementController:
         then per-step growth with vLLM retract) or "native" (stock vLLM)."""
         return await self.gather("placement_set_mode", mode, int(reserve_extra))
 
-    def kv_capacity(self, memory, summaries, utilization):
-        """Per-GPU KV bytes kvcached can map for both tenants: mapped + free - headroom (kvcached keeps
-        (1 - utilization) of total memory free, see page_allocator get_avail_physical_pages)."""
+    def worker_capacity(self, memory, summaries, utilization):
         capacity = []
         for rank in range(self.num_ranks):
-            free = min(memory[model][rank][0]["free_mib"] for model in (0, 1)) * 1024**2
-            total = memory[0][rank][0]["total_mib"] * 1024**2
+            if any(len(memory[model][rank]) != self.tensor_parallel_size for model in (0, 1)):
+                raise RuntimeError("Missing TP worker memory snapshot")
             mapped = sum(summaries[model][rank]["mapped_bytes"] for model in (0, 1))
-            capacity.append(mapped + free - total * (1 - utilization))
+            group = []
+            for lane in range(self.tensor_parallel_size):
+                first, second = (memory[model][rank][lane] for model in (0, 1))
+                if first["gpu_uuid"] != second["gpu_uuid"] or first["total_mib"] != second["total_mib"]:
+                    raise RuntimeError("Tenant memory snapshots refer to different GPUs")
+                free = min(first["free_mib"], second["free_mib"]) * 1024**2
+                group.append(mapped + free - first["total_mib"] * 1024**2 * (1 - utilization))
+            capacity.append(group)
         return capacity
+
+    def kv_capacity(self, memory, summaries, utilization):
+        return [min(group) for group in self.worker_capacity(memory, summaries, utilization)]
 
     async def apply_ballast(self, cap_gib, utilization):
         """Hold device memory so each GPU's shared KV capacity is floor(cap / page) whole page bundles, as under the
@@ -154,29 +257,35 @@ class PlacementController:
         summaries = await self.summaries()
         page = summaries[0][0]["page_bytes"]
         target = (math.floor(cap_gib * GIB / page) + 0.5) * page
-        natural = self.kv_capacity(await self.memory(), summaries, utilization)
-        if any(value < target for value in natural):
+        if any(rank["page_bytes"] != page for model in summaries for rank in model):
+            raise RuntimeError("Ballast requires matching per-worker KV page geometry")
+        natural = self.worker_capacity(await self.memory(), summaries, utilization)
+        if any(value < target for group in natural for value in group):
             raise RuntimeError(f"Natural KV capacity {natural} is below the native target {target / GIB:.3f} GiB")
         capacity = natural
         for slack in (0.25 * page, 0.0):
-            excess = [max(0, int(value - target - slack)) for value in capacity]
+            excess = [[max(0, int(value - target - slack)) for value in group] for group in capacity]
             share = (0, 1) if slack else (0,)
             await asyncio.gather(*[self.call(model, rank, "collective_rpc", "placement_ballast", 120,
-                                             (excess[rank] // len(share),), {})
+                                             (([value // len(share) for value in excess[rank]]
+                                               if self.tensor_parallel_size > 1 else excess[rank][0] // len(share)),), {})
                                    for rank in range(self.num_ranks) for model in share])
-            capacity = self.kv_capacity(await self.memory(), await self.summaries(), utilization)
-        if any(abs(value - target) > 0.25 * page for value in capacity):
+            capacity = self.worker_capacity(await self.memory(), await self.summaries(), utilization)
+        if any(abs(value - target) > 0.25 * page for group in capacity for value in group):
             raise RuntimeError(f"Ballast missed the KV target {target / GIB:.3f} GiB: {capacity}")
         return {"cap_gib": cap_gib, "utilization": utilization, "page_bytes": page, "target_gib": target / GIB,
-                "pages": math.floor(cap_gib * GIB / page), "natural_capacity_gib": [value / GIB for value in natural],
-                "capacity_gib": [value / GIB for value in capacity]}
+                "pages": math.floor(cap_gib * GIB / page),
+                "natural_capacity_gib": [min(group) / GIB for group in natural],
+                "capacity_gib": [min(group) / GIB for group in capacity],
+                "worker_natural_capacity_gib": [[value / GIB for value in group] for group in natural],
+                "worker_capacity_gib": [[value / GIB for value in group] for group in capacity]}
 
     async def release_ballast(self, utilization):
         released = await asyncio.gather(*[self.call(model, rank, "collective_rpc", "placement_ballast_release", 120,
                                                     (), {})
                                           for model in (0, 1) for rank in range(self.num_ranks)])
         capacity = self.kv_capacity(await self.memory(), await self.summaries(), utilization)
-        return {"released_bytes": sum(item[0]["released_bytes"] for item in released),
+        return {"released_bytes": sum(shard["released_bytes"] for item in released for shard in item),
                 "capacity_gib": [value / GIB for value in capacity]}
 
     async def pause_boundary(self, observations, models=(0, 1)):
@@ -261,11 +370,9 @@ class PlacementController:
                 return {"reservation_pending": False, "reserved_at": record["reserved_at"]}
             tokens = record["reservation_tokens"]
             if fits(observations, model, rank, tokens, self.budgets):
-                if model == 0:
-                    self.begin_code_change()
+                self.begin_change(model)
                 result = await self.call(model, rank, "placement_retry_reservation", record["id"])
-                if model == 0:
-                    self.end_code_change()
+                self.end_change(model)
                 return {"reservation_pending": result.get("reservation_pending", True),
                         "reserved_at": result.get("reserved_at")}
             return {"reservation_pending": True, "reserved_at": None}
@@ -286,15 +393,14 @@ class PlacementController:
                     hold_started = time.monotonic()
                     await before_admit()
                     report["before_admit_s"] = time.monotonic() - hold_started
-                if model == 0:
-                    self.begin_code_change()
+                self.begin_change(model)
                 reservation = await admit(target)
-                if model == 0:
+                if model == 0 or self.general:
                     view = None
                     if self.fast_admission and reservation.get("rank_observation") is not None:
-                        view = list(observations[0])
+                        view = list(observations[model])
                         view[target] = reservation["rank_observation"]
-                    self.end_code_change(view)
+                    self.end_change(model, view, at=started)
                 report.update(target=target, admitted=not reservation.get("reservation_pending", False),
                               submitted=True, reservation_pending=reservation.get("reservation_pending", False))
             report["control_s"] = time.monotonic() - started
@@ -342,6 +448,8 @@ class PlacementController:
                             transaction, move["model"], move["id"], move["source"], move["destination"]))
                 except CleanMigrationFailure as error:
                     report["move_failure"] = str(error)
+                if self.general and report["moves"]:
+                    self.drop_views({event["model"] for event in report["moves"]})
                 if report["moves"]:
                     report["transfer_memory"] = await self.memory(release_unused=True, models=pause_models)
                 current = await self.snapshots(refresh_physical_capacity=bool(report["moves"]))
@@ -352,15 +460,16 @@ class PlacementController:
                     margin = admission_headroom(current)[target] if admission_headroom is not None else 0.0
                     report["admission_headroom_gib"] = margin
                     if fits(current, admission["model"], target, admission["tokens"], self.budgets, headroom=margin):
-                        if admission["model"] == 0:
-                            self.begin_code_change()
+                        model = admission["model"]
+                        admitted_at = time.monotonic()
+                        self.begin_change(model)
                         reservation = await admit(target)
-                        if admission["model"] == 0:
+                        if model == 0 or self.general:
                             view = None
                             if self.fast_admission and reservation.get("rank_observation") is not None:
-                                view = list(current[0])
+                                view = list(current[model])
                                 view[target] = reservation["rank_observation"]
-                            self.end_code_change(view)
+                            self.end_change(model, view, at=admitted_at)
                         report.update(target=target, submitted=True,
                                       admitted=not reservation.get("reservation_pending", False))
                     else:
@@ -437,9 +546,9 @@ class PlacementController:
             errors = [result for result in results if isinstance(result, BaseException)]
             if errors:
                 raise RuntimeError("Peer transfer failed") from errors[0]
-            if not (results[source]["bitwise_verified"] and results[destination]["bitwise_verified"]
-                    and results[source]["role"] == "source" and results[destination]["role"] == "destination"):
-                raise RuntimeError("Peer transfer lacks bytewise proof")
+            from tp_migration import verify_transfer_endpoints
+
+            verify_transfer_endpoints(results[source], results[destination], self.tensor_parallel_size)
             peer_completed = True
             mark("peer_copy")
             await self.call(model, destination, "placement_runner_state", transaction, imported)
@@ -457,6 +566,9 @@ class PlacementController:
                      "source_mapped_after": after["mapped_bytes"], "copy_peak_gib": copy_peak, "stage_s": stage_s,
                      "worker_stage_s": {"source": results[source]["stage_s"],
                                         "destination": results[destination]["stage_s"]},
+                     "tensor_parallel_size": self.tensor_parallel_size,
+                     "worker_shards": {"source": results[source].get("shards", []),
+                                       "destination": results[destination].get("shards", [])},
                      "bitwise_verified": True}
             self.events.append(event)
             return event

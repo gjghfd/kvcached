@@ -4,8 +4,7 @@ import types
 from pathlib import Path
 
 import pytest
-
-torch = pytest.importorskip("torch")
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime"))
 
@@ -40,12 +39,14 @@ class FakeGroup:
         return RankView()
 
 
-def run_transfer(source, destination, blocks_by_rank, num_blocks, views_by_rank):
-    group = FakeGroup(WORLD)
+def run_transfer(source, destination, blocks_by_rank, num_blocks, views_by_rank, tp_size=1, tp_rank=0):
+    world_size = len(views_by_rank)
+    group = FakeGroup(world_size)
     results, errors = {}, []
     local = threading.local()
     module = types.ModuleType("vllm.distributed.parallel_state")
     module.get_dp_group = lambda: local.group
+    module.get_tp_group = lambda: types.SimpleNamespace(rank_in_group=tp_rank, world_size=tp_size)
     saved = {name: sys.modules.get(name) for name in ("vllm.distributed", "vllm.distributed.parallel_state")}
     sys.modules["vllm.distributed"] = types.ModuleType("vllm.distributed")
     sys.modules["vllm.distributed.parallel_state"] = module
@@ -62,7 +63,7 @@ def run_transfer(source, destination, blocks_by_rank, num_blocks, views_by_rank)
             errors.append((rank, error))
             group.barrier.abort()
 
-    threads = [threading.Thread(target=worker, args=(rank,)) for rank in range(WORLD)]
+    threads = [threading.Thread(target=worker, args=(rank,)) for rank in range(world_size)]
     try:
         for thread in threads:
             thread.start()
@@ -112,4 +113,25 @@ def test_chunking_with_many_blocks():
 def test_bystander_with_blocks_is_rejected():
     views = {rank: make_views(rank) for rank in range(WORLD)}
     results, errors = run_transfer(0, 1, {0: [1, 2], 1: [3, 4], 2: [5, 6]}, 2, views)
-    assert errors and any(rank == 2 for rank, _ in errors)
+    assert any(rank == 2 and isinstance(error, ValueError)
+               and str(error) == "Bystander ranks must not supply blocks" for rank, error in errors), errors
+
+
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_tp2_lane_payload_and_identity_are_preserved(tp_rank):
+    views = {rank: make_views(100 * tp_rank + rank) for rank in range(2)}
+    before = {rank: [view.clone() for view in views[rank]] for rank in range(2)}
+    source_blocks, destination_blocks = [3, 9, 10], [40, 41, 42]
+    results, errors = run_transfer(0, 1, {0: source_blocks, 1: destination_blocks}, 3, views,
+                                   tp_size=2, tp_rank=tp_rank)
+    assert not errors, errors
+    assert set(results) == {0, 1}
+    assert results[0]["role"] == "source" and results[1]["role"] == "destination"
+    for rank, result in results.items():
+        assert result["rank"] == rank and result["tp_rank"] == tp_rank and result["tp_size"] == 2
+        assert result["bitwise_verified"] and result["integrity"] == "device_echo_full_bytewise"
+    for view_index in range(2):
+        expected = before[1][view_index].clone()
+        expected[destination_blocks] = before[0][view_index][source_blocks]
+        assert torch.equal(views[1][view_index], expected)
+        assert torch.equal(views[0][view_index], before[0][view_index])

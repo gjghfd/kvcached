@@ -1,4 +1,4 @@
-"""Paper Table 2 (master strategy table): rows R1-R14 over several seeds, plus single-component pairs.
+"""Paper Table 2 (master strategy table): rows R1-R21 over several seeds, plus single-component pairs.
 
 Each --job is SEED=LABEL=PATH/out/trace. A row's per-seed value is the mean over the runs of that seed; pairs use runs
 of the same job (request-level paired bootstrap), and fall back to a cross-job pairing on the same trace, marked "x".
@@ -17,13 +17,23 @@ from report_main import SLO, bootstrap_ratio, load, paired  # noqa: E402
 ROWS = {"R1": "kvcached_native", "R2": "no_move_v2", "R3": "no_move_fair_v2", "R4": "mig_random_v2",
         "R5": "ca_admit_v2", "R6": "ca_return_v2", "R7": "ca_full_v2", "R8": "no_move_tm_v2",
         "R9": "mig_random_tm_v2", "R10": "ca_full_tm_v2", "R11": "ca_full_tm_s4", "R12": "ca_full_tm_slo",
-        "R13": "ca_full_v2_nh", "R14": "ca_full_tm_slo_nh"}
+        "R13": "ca_full_v2_nh", "R14": "ca_full_tm_slo_nh",
+        # single-component ablations of R12 under its own scheduling (time-multiplexing + on-demand slicing), V14
+        "R15": "no_move_tm_slo", "R16": "mig_random_tm_slo", "R17": "ca_admit_tm_slo", "R18": "ca_return_tm_slo",
+        "R19": "ca_full_tm_slo_v1",
+        # controlled baselines without growth headroom (stock admission semantics + controller-side queueing), V15
+        "R20": "no_move_v2_nh", "R21": "no_move_tm_slo_nh"}
 PAIRS = [("R1", "R2", "准入方式（控制器侧排队）"), ("R2", "R3", "公平门"), ("R2", "R4", "迁移（并行）"),
          ("R4", "R5", "代价感知准入"), ("R4", "R6", "代价感知回迁"), ("R6", "R7", "回迁之上加代价感知准入"),
          ("R4", "R7", "placement（并行）"), ("R2", "R8", "分时（不迁移）"), ("R8", "R9", "迁移（分时）"),
          ("R4", "R9", "分时（随机）"), ("R9", "R10", "placement（分时）"), ("R7", "R10", "分时（代价感知）"),
          ("R10", "R12", "按需切片"), ("R11", "R12", "按需对周期"), ("R13", "R7", "增长余量（并行）"),
-         ("R14", "R12", "增长余量（分时）"), ("R2", "R12", "整体（控制器基线）"), ("R1", "R12", "整体（原生，截断）")]
+         ("R14", "R12", "增长余量（分时）"), ("R15", "R12", "迁移（分时 + 切片）"), ("R16", "R12", "placement（分时 + 切片）"),
+         ("R17", "R12", "回迁（分时 + 切片）"), ("R18", "R12", "代价感知准入（分时 + 切片）"), ("R19", "R12", "控制面 v2"),
+         ("R2", "R12", "整体（控制器基线）"), ("R1", "R12", "整体（原生，截断）"),
+         ("R1", "R20", "控制器侧排队（都不留余量）"), ("R2", "R20", "基线的增长余量（并行）"),
+         ("R15", "R21", "基线的增长余量（分时 + 切片）"), ("R21", "R12", "迁移（分时 + 切片，基线不留余量）"),
+         ("R20", "R12", "整体（不留余量的受控基线）")]
 WINDOW = (420.0, 900.0)
 
 
@@ -53,7 +63,10 @@ def fmt(item, bold=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--job", action="append", required=True, help="SEED=LABEL=PATH (repeatable)")
+    parser.add_argument("--general", action="store_true",
+                        help="rows are the general (type-agnostic) policies *_g; R1 stays the native deployment")
     args = parser.parse_args()
+    rows = {row: policy if row == "R1" or not args.general else f"{policy}_g" for row, policy in ROWS.items()}
     jobs = []
     for spec in args.job:
         seed, label, path = spec.split("=", 2)
@@ -61,7 +74,7 @@ def main():
     seeds = list(dict.fromkeys(seed for seed, _, _ in jobs))
     runs = {}  # (seed, row) -> [(label, requests, origin, summary)]
     for seed, label, root in jobs:
-        for row, policy in ROWS.items():
+        for row, policy in rows.items():
             if (root / policy / "requests.json").exists():
                 requests, origin, transactions, _ = load(root, policy)
                 runs.setdefault((seed, row), []).append((label, requests, origin,
@@ -69,7 +82,7 @@ def main():
     print("| 行 | 策略 | " + " | ".join(f"seed {seed}: Code TTFT / Conv TPOT avg, p95, p99 / Conv TTFT p99 / Conv SLO / "
                                         f"抢占（轮次）" for seed in seeds) + " |")
     print("|---|---|" + "---|" * len(seeds))
-    for row, policy in ROWS.items():
+    for row, policy in rows.items():
         cells = []
         for seed in seeds:
             items = runs.get((seed, row), [])

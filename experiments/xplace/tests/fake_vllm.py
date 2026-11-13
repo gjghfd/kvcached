@@ -306,7 +306,8 @@ class FakeTenant:
             return [{"released_bytes": released, "free_mib": self.free_bytes(rank) / 1024**2,
                      "total_mib": TOTAL_MIB}]
         assert method == "placement_memory_snapshot"
-        return [{"free_mib": self.free_bytes(rank) / 1024**2, "total_mib": TOTAL_MIB}]
+        return [{"gpu_uuid": f"fake-gpu-{rank}", "free_mib": self.free_bytes(rank) / 1024**2,
+                 "total_mib": TOTAL_MIB}]
 
 
 class FakeEngineCore:

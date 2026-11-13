@@ -7,6 +7,8 @@ import torch
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group, get_tp_group
 from vllm.v1.worker.gpu_worker import Worker
 
+from parallel_topology import worker_filename
+
 
 class VerificationWorker(Worker):
     def initialize_from_config(self, kv_cache_config):
@@ -15,8 +17,8 @@ class VerificationWorker(Worker):
         from kvcached.integration.vllm.interfaces import observability_snapshot_dict
 
         runtime = observability_snapshot_dict()
-        if not runtime["initialized"] or runtime["world_size"] != 1:
-            raise RuntimeError(f"KV runtime is not rank-local: {runtime}")
+        if not runtime["initialized"] or runtime["world_size"] != get_tp_group().world_size:
+            raise RuntimeError(f"KV runtime does not match the TP group: {runtime}")
         if runtime["device"] != str(self.device):
             raise RuntimeError(f"KV runtime device does not match worker: {runtime}")
         model = self.model_runner.get_model()
@@ -55,9 +57,17 @@ class VerificationWorker(Worker):
             "initialized_ns": time.time_ns(),
             "dp_pause_sync_interval": int(os.environ.get("DP_OPT_PAUSE_SYNC_INTERVAL", "32")),
         }
-        path = Path(os.environ["DP_OPT_EVIDENCE_ROOT"]) / (
-            f'worker-{record["service"]}-dp{record["dp_rank"]}.json'
-        )
+        if os.environ.get("XPLACE_CAUSAL_MANIFEST"):
+            from causal_deployment import worker_attestation
+
+            record["causal_deployment"] = worker_attestation(self)
+        self._placement_timing_identity = {"service": record["service"], "dp_rank": record["dp_rank"],
+                                           "tp_rank": groups["tp"]["rank"], "gpu_uuid": record["gpu_uuid"]}
+        from live_observation import start_worker_observer
+
+        start_worker_observer(self)
+        path = Path(os.environ["DP_OPT_EVIDENCE_ROOT"]) / worker_filename(
+            record["service"], record["dp_rank"], groups["tp"]["rank"], groups["tp"]["world_size"])
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(record, indent=2) + "\n")
         temporary.replace(path)
@@ -76,12 +86,23 @@ class VerificationWorker(Worker):
 
             self.model_runner._determine_batch_execution_and_padding = capture
 
+        from graph_execution import start_worker_graph_execution
+
+        start_worker_graph_execution(self)
+
+    def placement_graph_execution(self, command, case):
+        from graph_execution import worker_graph_control
+
+        return worker_graph_control(self, command, case)
+
     def placement_memory_snapshot(self, release_unused=False):
         torch.cuda.synchronize(self.device)
         if release_unused:
             torch.cuda.empty_cache()
         free, total = torch.cuda.mem_get_info(self.device)
         return {"gpu_uuid": str(torch.cuda.get_device_properties(self.device).uuid),
+                "rank": get_dp_group().rank_in_group, "tp_rank": get_tp_group().rank_in_group,
+                "tp_size": get_tp_group().world_size,
                 "gpu_name": torch.cuda.get_device_name(self.device),
                 "free_mib": free / 1024**2, "total_mib": total / 1024**2,
                 "torch_allocated_mib": torch.cuda.memory_allocated(self.device) / 1024**2,
@@ -91,12 +112,23 @@ class VerificationWorker(Worker):
     def placement_ballast(self, num_bytes):
         """Hold `num_bytes` more device memory; kvcached sizes every co-located pool from cudaMemGetInfo."""
         held = self.__dict__.setdefault("_placement_ballast", [])
+        if isinstance(num_bytes, list):
+            if len(num_bytes) != get_tp_group().world_size:
+                raise ValueError("Ballast must specify every TP worker")
+            num_bytes = num_bytes[get_tp_group().rank_in_group]
+        if type(num_bytes) is not int or num_bytes < 0:
+            raise ValueError("Ballast bytes must be a nonnegative integer")
         if num_bytes > 0:
             held.append(torch.empty(int(num_bytes), dtype=torch.uint8, device=self.device))
         torch.cuda.synchronize(self.device)
         free, total = torch.cuda.mem_get_info(self.device)
         return {"held_bytes": sum(tensor.numel() for tensor in held), "free_mib": free / 1024**2,
                 "total_mib": total / 1024**2}
+
+    def placement_timing(self, command, case=None):
+        from timing_probe import worker_timing_control
+
+        return worker_timing_control(self, command, case)
 
     def placement_ballast_release(self):
         held = self.__dict__.pop("_placement_ballast", [])

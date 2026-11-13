@@ -160,6 +160,31 @@ def test_headroom_rejects_a_rank_that_only_fits_without_growth():
     assert plan_usage(state, [], CODE, 0) is not None
     grown = build_state(observed, [14.5] * 4, growth_gib=(0.0, 0.3), slack_gib=0.0)
     assert plan_usage(grown, [], CODE, 0) is None
+    # relief_scope "destinations": the arrival's own rank is checked against target_growth_gib only
+    target_only = build_state(observed, [14.5] * 4, growth_gib=(0.0, 0.3), slack_gib=0.0, target_growth_gib=(0.0, 0.0))
+    assert plan_usage(target_only, [], CODE, 0) is not None
+
+
+def test_relief_floor_scope_keeps_destinations_guarded():
+    """Dropping the growth allowance on the target only needs no more moves than guarding every rank, and still
+    keeps the destinations' growth + slack free."""
+    observed = make_observed([6, 6, 6, 6])
+    budgets = [12.0] * 4
+    model = StepModel(default_dp2_params())
+    tight = build_state(observed, budgets, growth_gib=(0.0, 0.2), slack_gib=0.1)
+    state = build_state(observed, budgets, growth_gib=(0.0, 0.2), slack_gib=0.1, target_growth_gib=(0.0, 0.0))
+    guarded = plan_admission(tight, CODE, "ca", model, DEFAULT_PARAMS)
+    plan = plan_admission(state, CODE, "ca", model, DEFAULT_PARAMS)
+    assert plan["target"] is not None and len(plan["moves"]) <= len(guarded["moves"])
+    used = plan_usage(state, plan["moves"], CODE, plan["target"])
+    destination = {move["id"]: move["destination"] for move in plan["moves"]}
+    counts = [0] * 4
+    for request in state["requests"]:
+        if request["model"] == 1:
+            counts[destination.get(request["id"], request["rank"])] += 1
+    for rank in set(destination.values()):
+        assert used[rank] + counts[rank] * 0.2 + 0.1 <= budgets[rank] + 1e-6
+    assert used[plan["target"]] + 0.1 <= budgets[plan["target"]] + 1e-6
 
 
 def test_conv_growth_tokens_uses_rates_not_lengths():
@@ -174,6 +199,12 @@ def test_conv_growth_tokens_uses_rates_not_lengths():
     sliced = conv_growth_tokens(model, params, counts, contexts, 100000, True, (2.0, 1.0, 15.0))
     corun = conv_growth_tokens(model, params, counts, contexts, 100000, False)
     assert held == relief and sliced >= relief and corun >= relief
+    # without the relief floor (the arrival's own rank): only the residency growth remains
+    assert conv_growth_tokens(model, params, counts, contexts, floor=False) == 0.0
+    assert conv_growth_tokens(model, params, counts, contexts, 100000, True, floor=False) == 0.0
+    sliced_only = conv_growth_tokens(model, params, counts, contexts, 100000, True, (2.0, 1.0, 15.0), floor=False)
+    corun_only = conv_growth_tokens(model, params, counts, contexts, 100000, False, floor=False)
+    assert 0.0 < sliced_only < relief and corun_only > 0.0 and math.isclose(max(relief, corun_only), corun)
 
 
 def test_arrival_counts_pages_released_by_its_moves_toward_free_blocks():

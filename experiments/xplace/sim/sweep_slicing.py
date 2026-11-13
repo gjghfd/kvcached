@@ -3,6 +3,8 @@
 Periodic slicing (S, R): every S s of Conv hold during a Code prefill, Conv runs R s. On-demand slicing
 (T_wait, R, S_max): slice when a held Conv waits T_wait s for its first token, or the hold lasted S_max s.
 Usage: python3 sim/sweep_slicing.py --replicas 3 --output X.json
+--general builds the variants from the general (type-agnostic) policy ca_full_tm_v2_g with planner-params-v5.json
+(default: the legacy ca_full_tm_v2 with planner-params-v3.json); traces and noise seeds are the same.
 """
 import argparse
 import json
@@ -24,22 +26,27 @@ VARIANTS = {"none": None}
 VARIANTS.update({f"periodic_S{period}": (float(period), 1.0) for period in (3, 4, 5, 6, 8)})
 VARIANTS.update({f"ondemand_T{wait}": (float(wait), 1.0, 15.0) for wait in (1, 2, 4, 8)})
 VARIANTS.update({f"ondemand_T2_M{limit}": (2.0, 1.0, float(limit)) for limit in (8, 30)})
-for _name, _slice in VARIANTS.items():
-    _spec = dict(simulator.POLICIES["ca_full_tm_v2"])
-    if _slice:
-        _spec["slice"] = _slice
-    simulator.POLICIES[f"sweep_{_name}"] = _spec
+# (base policy, planner file, simulator policy prefix) per mode
+MODES = {False: ("ca_full_tm_v2", "planner-params-v3.json", "sweep_"),
+         True: ("ca_full_tm_v2_g", "planner-params-v5.json", "sweep_g_")}
+for _base, _, _prefix in MODES.values():
+    for _name, _slice in VARIANTS.items():
+        _spec = dict(simulator.POLICIES[_base])
+        if _slice:
+            _spec["slice"] = _slice
+        simulator.POLICIES[f"{_prefix}{_name}"] = _spec
 
 
 def job(item):
-    seed, name, replica = item
+    seed, name, replica, general = item
+    _, planner_file, prefix = MODES[general]
     trace = json.loads((INPUTS / f"cur-b16-c012-p120-s{seed}-d900.json").read_text())
     truth = json.loads((HERE / "truth-pilot-nm-v2.json").read_text())
     belief = json.loads((INPUTS / "step-params-dp4-v1.json").read_text())
-    planner = json.loads((INPUTS / "planner-params-v3.json").read_text())
+    planner = json.loads((INPUTS / planner_file).read_text())
     params = {"num_ranks": 4, "budget_gib": 16.0, **truth.get("sim", {}), "interference_cv": 0.37, "prefill_cv": 0.09,
               "noise_seed": 9000 + replica, "kv_mode": "prompt", "reserve_extra_tokens": 256}
-    out = simulator.simulate(trace, f"sweep_{name}", sim_params=params, step_params=truth,
+    out = simulator.simulate(trace, f"{prefix}{name}", sim_params=params, step_params=truth,
                              planner_step_params=belief, planner_params=planner)
     result = metrics(out["requests"], 0.0, 420.0, 900.0, slo=SLO)
     keys = ("code_ttft_avg", "conv_tpot_avg", "conv_ttft_avg", "conv_ttft_p99", "conv_slo_attainment")
@@ -50,14 +57,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--replicas", type=int, default=3)
     parser.add_argument("--workers", type=int, default=11)
+    parser.add_argument("--general", action="store_true", help="variants of ca_full_tm_v2_g, planner-params-v5.json")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    items = [(seed, name, replica) for seed in (911, 914) for name in VARIANTS for replica in range(args.replicas)]
+    items = [(seed, name, replica, args.general) for seed in (911, 914) for name in VARIANTS
+             for replica in range(args.replicas)]
     started = time.time()
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         runs = [{"seed": item[0], "variant": item[1], "slice": VARIANTS[item[1]], "replica": item[2], **out}
                 for item, out in pool.map(job, items)]
-    args.output.write_text(json.dumps({"page_model": simulator.DEFAULT_SIM["page_model"], "runs": runs}) + "\n")
+    header = {"page_model": simulator.DEFAULT_SIM["page_model"]}
+    if args.general:
+        base, planner_file, _ = MODES[True]
+        header.update(general=True, base_policy=base, planner=planner_file)
+    args.output.write_text(json.dumps({**header, "runs": runs}) + "\n")
     print(f"{len(items)} runs in {time.time() - started:.0f}s -> {args.output}")
 
 

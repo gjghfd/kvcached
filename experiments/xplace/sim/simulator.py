@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime"))
 
 from cost_model import StepModel, capture_bucket  # noqa: E402
 from fairness import FairAdmissionGate  # noqa: E402
-from planner import DEFAULT_PARAMS, build_state, conv_growth_tokens, plan_admission, plan_return  # noqa: E402
+from planner import (DEFAULT_PARAMS, RELIEF_FLOOR_ON_TARGET, build_state, conv_growth_tokens, growth_tokens,  # noqa: E402
+                     plan_admission, plan_return, run_seconds, solo_rate, tm_gain)
 
 BLOCK_TOKENS, PAGE_BLOCKS = 16, 64
 PAGE_BYTES, BLOCK_BYTES = 96 * 1024**2, int(1.5 * 1024**2)
@@ -64,6 +65,23 @@ POLICIES["ca_full_tm_slo"] = dict(POLICIES["ca_full_tm_v2"], slice=(2.0, 1.0, 15
 # ablation (current-length setting): placement without growth headroom
 POLICIES["ca_full_tm_slo_nh"] = dict(POLICIES["ca_full_tm_slo"], no_headroom=True)
 POLICIES["ca_full_v2_nh"] = dict(POLICIES["ca_full_v2"], no_headroom=True)
+# ablations of the final scheme ca_full_tm_slo (same names as live); fast Conv admission is not modeled, so the
+# v1 variant differs from the final scheme only by admitting Code before Conv reaches its pause boundary
+_SLO = (2.0, 1.0, 15.0)
+POLICIES["no_move_tm_slo"] = dict(POLICIES["no_move_tm_v2"], slice=_SLO)
+POLICIES["mig_random_tm_slo"] = dict(POLICIES["mig_random_tm_v2"], slice=_SLO)
+POLICIES["ca_admit_tm_slo"] = dict(POLICIES["ca_admit"], isolate=True, hold_first=True, slice=_SLO)
+POLICIES["ca_return_tm_slo"] = dict(POLICIES["ca_return"], isolate=True, hold_first=True, slice=_SLO)
+POLICIES["ca_full_tm_slo_v1"] = dict(POLICIES["ca_full_tm"], slice=_SLO)
+# baselines without growth headroom (stock current-length admission semantics, controller-side queueing)
+POLICIES["no_move_v2_nh"] = dict(POLICIES["no_move_v2"], no_headroom=True)
+POLICIES["no_move_tm_slo_nh"] = dict(POLICIES["no_move_tm_slo"], no_headroom=True)
+# General (type-agnostic) algorithm (Paper/design.md §5, live policies *_g): per-request growth headroom on every
+# admission, migration for any fragmentation-blocked request, episodes of time-multiplexing started by a prefill's
+# gain (`isolate` enables them), returns over every tenant
+for _name, _spec in list(POLICIES.items()):
+    if not _spec.get("native"):
+        POLICIES[f"{_name}_g"] = dict(_spec, general=True)
 
 DEFAULT_SIM = {"num_ranks": 4, "budget_gib": 40.0, "pause_boundary": 32, "transaction_fixed_s": 0.3,
                "move_fixed_s": 0.05, "copy_gib_s": 10.0, "admission_overhead_s": 0.01,
@@ -93,11 +111,13 @@ class Request:
     __slots__ = ("mark", "id", "model", "prompt", "output", "arrival", "rank", "rank_initial", "reserved_at",
                  "first_token_at", "completed_at", "start_step", "chunks_left", "pages", "blocks", "moves", "path",
                  "factor", "prefill_factor", "generated", "held_blocks", "order", "recompute_left", "preemptions",
-                 "ctx", "prefill_chunks", "holdings")
+                 "ctx", "prefill_chunks", "holdings", "chunked")
 
     def __init__(self, mark):
         self.mark, self.id, self.model = mark, mark["request_id"], mark["model"]
         self.prompt, self.output, self.arrival = mark["prompt_tokens"], mark["output_tokens"], mark["arrival_s"]
+        # a prompt longer than one 4096-token chunk prefills step by step (Code here); a short one joins decoding
+        self.chunked = self.prompt > CHUNK_TOKENS
         self.rank = self.rank_initial = self.reserved_at = self.first_token_at = self.completed_at = None
         self.start_step = None
         self.chunks_left = self.prefill_chunks = 0
@@ -219,6 +239,7 @@ class Simulator:
         self.belief = StepModel(planner_step_params or step_params)
         self.prefill = step_params.get("code_prefill", {"solo_s_per_100k": 26.4, "with_other_s_per_100k": 54.0})
         self.planner_params = dict(DEFAULT_PARAMS, **(planner_params or {}))
+        self.target_floor = RELIEF_FLOOR_ON_TARGET[self.planner_params["relief_scope"]]
         self.now, self.sequence, self.events = 0.0, 0, []
         self.tenants = [Tenant(0, self.num_ranks), Tenant(1, self.num_ranks)]
         self.queues = [[], []]
@@ -235,6 +256,10 @@ class Simulator:
         self.code_arrivals = 0
         self.order = 0
         self.preemptions, self.recompute_tokens = [0, 0], [0, 0]
+        # general policies: the time-multiplexing episode in force ({"x", "triggers", "start"}) and arrival needs
+        self.general = bool(self.spec.get("general"))
+        self.episode = None
+        self.episodes, self.arrival_needs = [], []
 
     # ---------- event plumbing ----------
     def push(self, time, kind, payload=None):
@@ -257,7 +282,8 @@ class Simulator:
         return {"policy": self.policy, "requests": [self.record(request) for request in self.completed],
                 "decisions": self.decisions, "migrations": self.migrations, "population": self.population,
                 "budgets_gib": self.budgets, "hold_intervals": self.hold_intervals, "kv_mode": self.mode,
-                "preemptions": list(self.preemptions), "recompute_tokens": list(self.recompute_tokens)}
+                "preemptions": list(self.preemptions), "recompute_tokens": list(self.recompute_tokens),
+                **({"episodes": self.episodes} if self.general else {})}
 
     def record(self, request):
         return {"request_id": request.id, "trace_request_id": request.id, "model": request.model,
@@ -303,7 +329,7 @@ class Simulator:
     def target_blocks(self, request):
         """Blocks the request needs now: current length (native Code prefill: computed chunks + the next one)."""
         tokens = request.prompt + request.generated
-        if request.model == 0 and request.start_step is None and self.mode == "native":
+        if request.chunked and request.start_step is None and self.mode == "native":
             done = request.prefill_chunks - request.chunks_left
             tokens = min(request.prompt, (done + 1) * CHUNK_TOKENS)
         if self.mode == "prompt":
@@ -386,7 +412,7 @@ class Simulator:
         request.ctx = 0.0
         request.preemptions += 1
         self.preemptions[tenant.index] += 1
-        if request.model == 0 and request.start_step is None:
+        if request.chunked and request.start_step is None:
             done = request.prefill_chunks - request.chunks_left
             self.recompute_tokens[tenant.index] += min(request.prompt, done * CHUNK_TOKENS)
             request.chunks_left = request.prefill_chunks
@@ -410,7 +436,7 @@ class Simulator:
                 if request.recompute_left > 0:
                     self.set_blocks(tenant, request, need)
                 else:
-                    if request.model == 0 and request.start_step is None and not request.prefill_chunks:
+                    if request.chunked and request.start_step is None and not request.prefill_chunks:
                         self.init_code(request)
                     self.set_blocks(tenant, request, self.target_blocks(request))
                 self.commit_pages(tenant, rank)
@@ -471,14 +497,14 @@ class Simulator:
                    for request in list(tenant.active.values()) + list(tenant.joining.values()))
 
     # ---------- headroom (shared formula with the live runtime) ----------
-    def growth_gib(self, arrival_prompt=None):
+    def growth_gib(self, arrival_prompt=None, floor=True):
         if self.mode == "full" or self.spec.get("no_headroom"):
             return 0.0
         conv = self.tenants[1]
         counts = [conv.count[rank] + sum(1 for request in conv.joining.values() if request.rank == rank)
                   for rank in range(self.num_ranks)]
         tokens = conv_growth_tokens(self.belief, self.planner_params, counts, list(conv.context), arrival_prompt,
-                                    bool(self.spec.get("isolate")), self.spec.get("slice"))
+                                    bool(self.spec.get("isolate")), self.spec.get("slice"), floor)
         return tokens * BLOCK_GIB / BLOCK_TOKENS
 
     def slack_gib(self):
@@ -494,7 +520,152 @@ class Simulator:
     def code_headroom(self, rank, arrival_prompt):
         if self.mode == "full" or self.spec.get("no_headroom"):
             return 0.0
-        return self.conv_on(rank) * self.growth_gib(arrival_prompt) + self.slack_gib()
+        return self.conv_on(rank) * self.growth_gib(arrival_prompt, self.target_floor) + self.slack_gib()
+
+    # ---------- general (type-agnostic) algorithm, Paper/design.md §5 ----------
+    def exclusive(self):
+        """Tenant that runs while the others are held: the episode's (general) or the Code tenant (legacy TM)."""
+        if self.general:
+            return self.episode["x"] if self.episode else None
+        return 0 if self.spec.get("isolate") else None
+
+    def residents(self, tenant):
+        return (list(tenant.active.values()) + list(tenant.joining.values())
+                + [request for queue in tenant.waiting for request in queue])
+
+    def layout_of(self, tenant):
+        counts = [0] * self.num_ranks
+        for request in self.residents(tenant):
+            counts[request.rank] += 1
+        return counts, list(tenant.context)
+
+    def computed_tokens(self, request):
+        if request.start_step is not None:
+            return request.prompt + request.generated
+        if request.chunked:
+            return min(request.prompt, (request.prefill_chunks - request.chunks_left) * CHUNK_TOKENS)
+        return 0
+
+    def trigger_left(self, request):
+        """Seconds until a trigger no longer needs exclusivity: its prefill alone, then the grace after its first
+        token."""
+        if request.completed_at is not None:
+            return 0.0
+        grace = self.planner_params["tm_grace_s"]
+        if request.first_token_at is not None:
+            return max(0.0, grace - (self.now - request.first_token_at))
+        remaining = request.prompt - self.computed_tokens(request)
+        return remaining * self.belief.prefill_s_per_token(request.model) + grace
+
+    def episode_scope(self, arrival=None, trigger=False):
+        """(held tenants, seconds left) of the episode in force, or of the one admitting `arrival` starts."""
+        x = arrival.model if trigger else self.exclusive() if self.general else None
+        if x is None:
+            return set(), 0.0
+        left = ([self.trigger_left(request) for request in self.episode["triggers"].values()]
+                if self.episode and self.episode["x"] == x else [])
+        if trigger:
+            left.append(self.trigger_left(arrival))
+        return {tenant.index for tenant in self.tenants if tenant.index != x}, max([0.0] + left)
+
+    def general_growth(self, arrival=None, trigger=False):
+        """GROWTH (§5.1): GiB each request (and the arrival) may allocate beyond its reservation in the window."""
+        if self.mode == "full" or self.spec.get("no_headroom"):
+            return {}, 0.0
+        held, left = self.episode_scope(arrival, trigger)
+        rates = {tenant.index: solo_rate(self.belief, tenant.index, *self.layout_of(tenant)) for tenant in self.tenants}
+        unit, extra = BLOCK_GIB / BLOCK_TOKENS, self.params["reserve_extra_tokens"]
+
+        def gib(request, computed):
+            return unit * growth_tokens(rates[request.model], request.prompt, computed, request.prompt + extra,
+                                        self.belief.prefill_s_per_token(request.model),
+                                        run_seconds(self.planner_params, request.model in held, left,
+                                                    self.spec.get("slice")))
+
+        result = {request.id: gib(request, self.computed_tokens(request))
+                  for tenant in self.tenants for request in self.residents(tenant)}
+        return result, gib(arrival, 0) if arrival is not None else 0.0
+
+    def general_headroom(self, arrival=None, trigger=False):
+        result, own = self.general_growth(arrival, trigger)
+        totals = [self.slack_gib() + own] * self.num_ranks
+        for tenant in self.tenants:
+            for request in self.residents(tenant):
+                totals[request.rank] += result.get(request.id, 0.0)
+        return totals, own
+
+    def episode_gain(self, request):
+        others = [(tenant.index, *self.layout_of(tenant)) for tenant in self.tenants if tenant.index != request.model]
+        remaining = request.prompt - self.computed_tokens(request)
+        return tm_gain(self.belief, self.planner_params, request.model, remaining, others)
+
+    def episode_safe(self, x, left):
+        """The exclusive tenant's own growth during the episode fits each rank's free KV (held tenants free none)."""
+        tenant = self.tenants[x]
+        rate = solo_rate(self.belief, x, *self.layout_of(tenant))
+        grow = [0.0] * self.num_ranks
+        for request in self.residents(tenant):
+            grow[request.rank] += growth_tokens(rate, request.prompt, self.computed_tokens(request),
+                                                request.prompt + self.params["reserve_extra_tokens"],
+                                                self.belief.prefill_s_per_token(x), left)
+        return all(self.pages_on(rank) * PAGE_GIB + grow[rank] * BLOCK_GIB / BLOCK_TOKENS
+                   <= self.budgets[rank] + 1e-9 for rank in range(self.num_ranks))
+
+    def starts_episode(self, request):
+        if not self.spec.get("isolate") or (self.episode and self.episode["x"] != request.model):
+            return False
+        return self.episode_gain(request) > 0 and self.episode_safe(request.model, self.trigger_left(request))
+
+    def start_episode(self, request):
+        if self.episode is None:
+            self.episode = {"x": request.model, "triggers": {}, "start": self.now}
+        self.episode["triggers"][request.id] = request
+        for tenant in self.tenants:
+            if tenant.index != request.model:
+                self.hold(tenant)
+
+    def on_episode_check(self, _):
+        episode = self.episode
+        if episode is None:
+            return
+        grace = self.planner_params["tm_grace_s"]
+        if all(request.completed_at is not None
+               or (request.first_token_at is not None and self.now - request.first_token_at >= grace - 1e-9)
+               for request in episode["triggers"].values()):
+            self.episodes.append({"model": episode["x"], "triggers": sorted(episode["triggers"]),
+                                  "start": episode["start"], "end": self.now})
+            self.episode, self.code_run_since, self.slice_armed = None, None, False
+            self.tenants[episode["x"]].sliced = False
+            for tenant in self.tenants:
+                if tenant.index != episode["x"]:
+                    self.release(tenant)
+            self.start_step(self.tenants[episode["x"]])  # it may have been paused for a slice
+            self.maybe_start_episode()
+            self.dispatch()
+            self.kick()
+
+    def prefilling_requests(self):
+        return [request for tenant in self.tenants for request in self.residents(tenant)
+                if request.chunked and request.start_step is None]
+
+    def maybe_start_episode(self):
+        """A request still prefilling (e.g. admitted while another tenant was exclusive) starts an episode once
+        holding the others gains and is safe."""
+        if not (self.general and self.spec.get("isolate")) or self.episode is not None:
+            return
+        for request in sorted(self.prefilling_requests(), key=lambda item: item.arrival):
+            if self.episode_gain(request) > 0 and self.episode_safe(request.model, self.trigger_left(request)):
+                self.start_episode(request)
+                return
+
+    def long_prefill_in_flight(self):
+        return any(self.episode_gain(request) > 0 for request in self.prefilling_requests())
+
+    def risk_params(self):
+        history = self.planner_params["history_s"]
+        needs = [need for at, need in self.arrival_needs if at >= self.now - history]
+        return {"arrival_needs": needs,
+                "arrival_window_s": min(self.now, history) + self.planner_params["rate_prior_s"]}
 
     # ---------- arrivals and admission ----------
     def on_arrival(self, request):
@@ -511,6 +682,8 @@ class Simulator:
             tenant.waiting[rank].append(request)
             self.kick()
             return
+        if self.general:
+            self.arrival_needs.append((self.now, self.reservation_blocks(request) * BLOCK_GIB))
         self.queues[request.model].append(request)
         self.dispatch()
 
@@ -521,7 +694,7 @@ class Simulator:
         request.factor = max(0.2, 1.0 + self.params["interference_cv"] * (interference - 1.0))
         request.prefill_factor = max(0.5, 1.0 + self.params["prefill_cv"] * (prefill - 1.0))
 
-    def admit(self, request, rank, path):
+    def admit(self, request, rank, path, trigger=False):
         request.rank = request.rank_initial = rank
         request.reserved_at, request.path = self.now, path
         tenant = self.tenants[request.model]
@@ -532,59 +705,78 @@ class Simulator:
             request.order = self.order
             self.set_blocks(tenant, request, self.reservation_blocks(request))
             self.commit_pages(tenant, rank)
-        if request.model == 0:
+        if request.chunked:
             self.init_code(request)
         tenant.joining[request.id] = request
         if self.fairness is not None:
             self.fairness.reserved(request.id, self.now, self.now)
-        if self.spec.get("isolate") and request.model == 0:
+        if self.general:
+            if trigger:
+                self.start_episode(request)
+        elif self.spec.get("isolate") and request.model == 0:
             self.hold_conv()
         if not tenant.busy and not tenant.paused:
             self.start_step(tenant)
 
-    def hold_conv(self):
-        conv = self.tenants[1]
-        if conv.held:
+    def hold(self, tenant):
+        if tenant.held:
             return
-        if conv.busy:
-            conv.hold_pending = True
+        if tenant.busy:
+            tenant.hold_pending = True
         else:
-            self.mark_held(conv)
+            self.mark_held(tenant)
+
+    def hold_conv(self):
+        self.hold(self.tenants[1])
 
     def mark_held(self, conv):
         conv.held, conv.hold_pending = True, False
         self.hold_intervals.append([self.now, None])
 
-    def release_conv(self):
-        conv = self.tenants[1]
-        if conv.held and self.hold_intervals and self.hold_intervals[-1][1] is None:
+    def release(self, tenant):
+        if tenant.held and self.hold_intervals and self.hold_intervals[-1][1] is None:
             self.hold_intervals[-1][1] = self.now
-        conv.held = conv.hold_pending = False
-        if not conv.paused:
-            self.start_step(conv)
+        tenant.held = tenant.hold_pending = False
+        if not tenant.paused:
+            self.start_step(tenant)
+
+    def release_conv(self):
+        self.release(self.tenants[1])
+
+    def prefilling(self, index):
+        tenant = self.tenants[index]
+        return any(request.chunks_left > 0 for request in list(tenant.active.values()) + list(tenant.joining.values()))
 
     def code_prefilling(self):
-        code = self.tenants[0]
-        return any(request.chunks_left > 0 for request in list(code.active.values()) + list(code.joining.values()))
+        return self.prefilling(0)
+
+    def resume_slice(self, index):
+        tenant = self.tenants[index]
+        tenant.sliced = False
+        self.code_run_since = self.now
+        self.start_step(tenant)
 
     def resume_code_slice(self):
-        code = self.tenants[0]
-        code.sliced = False
-        self.code_run_since = self.now
-        self.start_step(code)
+        self.resume_slice(0)
 
     def on_slice_release(self, _):
-        if not self.tenants[0].sliced:
+        x = self.exclusive()
+        if x is None or not self.tenants[x].sliced:
             return
-        self.release_conv()
+        for tenant in self.tenants:
+            if tenant.index != x:
+                self.release(tenant)
         self.push(self.now + self.spec["slice"][1], "slice_end")
 
     def on_slice_end(self, _):
-        if not self.tenants[0].sliced:
+        x = self.exclusive()
+        if x is None or not self.tenants[x].sliced:
             return
-        self.hold_conv()
-        if self.tenants[1].held:
-            self.resume_code_slice()
+        others = [tenant for tenant in self.tenants if tenant.index != x]
+        for tenant in others:
+            self.hold(tenant)
+        if all(tenant.held for tenant in others):
+            self.resume_slice(x)
 
     def dispatch(self):
         if self.transaction is not None:
@@ -600,9 +792,15 @@ class Simulator:
                     self.fairness.update(waiting, self.now)
                     if not self.fairness.authorization(request.model, request.id, self.now)["allowed"]:
                         continue
-                candidates = [rank for rank in range(self.num_ranks)
-                              if self.fits(request, rank,
-                                           self.code_headroom(rank, request.prompt) if request.model == 0 else 0.0)]
+                trigger = False
+                if self.general:
+                    trigger = self.starts_episode(request)
+                    headroom, own = self.general_headroom(request, trigger)
+                    candidates = [rank for rank in range(self.num_ranks) if self.fits(request, rank, headroom[rank])]
+                else:
+                    candidates = [rank for rank in range(self.num_ranks)
+                                  if self.fits(request, rank, self.code_headroom(rank, request.prompt)
+                                               if request.model == 0 else 0.0)]
                 if candidates:
                     counts = self.tenants[request.model].count
                     joining = [0] * self.num_ranks
@@ -610,11 +808,50 @@ class Simulator:
                         joining[item.rank] += 1
                     rank = min(candidates, key=lambda r: (counts[r] + joining[r], self.pages_on(r), r))
                     self.queues[request.model].pop(0)
-                    self.admit(request, rank, "direct")
+                    self.admit(request, rank, "direct", trigger)
                     progressed = True
                     continue
-                if self.spec["admission"] is not None and self.try_migration(request):
+                if self.spec["admission"] is None:
+                    continue
+                if self.general:
+                    if self.fragmented(request, headroom, own) and self.try_migration_general(request):
+                        return
+                elif self.try_migration(request):
                     return
+        if self.general:
+            self.maybe_start_episode()
+
+    def fragmented(self, request, headroom, own):
+        """Blocked by fragmentation, not capacity: the free KV beyond every rank's residents' headroom holds it."""
+        need = self.reservation_blocks(request) * BLOCK_GIB
+        spare = sum(max(0.0, budget - used - (room - own))
+                    for budget, used, room in zip(self.budgets, self.used_gib(), headroom))
+        return spare >= need
+
+    def try_migration_general(self, request):
+        """Algorithm 2 (§5.3) for any blocked request: any tenant's decoding requests may move."""
+        if self.now < self.plan_not_before.get(request.id, 0.0):
+            return False
+        self.plan_not_before[request.id] = self.now + self.params["plan_retry_s"]
+        arrival = {"model": request.model, "tokens": request.prompt + self.params["reserve_extra_tokens"],
+                   "prompt_tokens": request.prompt}
+        seed = int.from_bytes(hashlib.sha256(f"{self.params['seed']}:{request.id}".encode()).digest()[:8], "big")
+        context = {}
+
+        def plan_fn():
+            context["trigger"] = self.starts_episode(request)
+            growth, own = self.general_growth(request, context["trigger"])
+            state = build_state(self.observed(), self.budgets, slack_gib=self.slack_gib(), request_growth=growth,
+                                arrival_growth_gib=own)
+            return plan_admission(state, arrival, self.spec["admission"], self.belief, self.planner_params, seed)
+
+        preplan = plan_fn()
+        if preplan.get("target") is None:
+            return False
+        self.start_transaction("admission", plan_fn, request, sorted({move["model"] for move in preplan["moves"]}))
+        if self.transaction is not None:
+            self.transaction["context"] = context
+        return True
 
     def try_migration(self, request):
         if self.now < self.plan_not_before.get(request.id, 0.0):
@@ -631,7 +868,7 @@ class Simulator:
 
         def plan_fn():
             state = build_state(self.observed(), self.budgets, (0.0, self.growth_gib(request.prompt)),
-                                self.slack_gib())
+                                self.slack_gib(), (0.0, self.growth_gib(request.prompt, self.target_floor)))
             return plan_admission(state, arrival, self.spec["admission"], self.belief, self.planner_params, seed)
 
         preplan = plan_fn()
@@ -654,18 +891,20 @@ class Simulator:
             if other.has_waiting() and not other.paused and self.params["dp_dummy_interference"]:
                 return "decode"
             return False
-        if other.index == 0 and not other.busy and other.sliced:
-            return False  # the Code is paused for a Conv slice
-        if other.index == 0 and not other.busy and self.spec.get("hold_first") and tenant.hold_pending:
-            return False  # the Code is waiting for this tenant's pause boundary and is not running yet
+        if not other.busy and other.sliced:
+            return False  # the exclusive tenant is paused for a slice of the held ones
+        if (other.index == self.exclusive() and not other.busy and self.spec.get("hold_first")
+                and tenant.hold_pending):
+            return False  # the exclusive tenant waits for this tenant's pause boundary and is not running yet
         if any(request.chunks_left > 0 for request in list(other.active.values()) + list(other.joining.values())):
             return "prefill"
         return "decode"
 
-    def prefill_factor(self, attribute="factor"):
-        """Mean noise factor of Code requests currently in prefill (1.0 if none or noise disabled)."""
-        factors = [getattr(request, attribute) for request in list(self.tenants[0].active.values())
-                   + list(self.tenants[0].joining.values()) if request.chunks_left > 0]
+    def prefill_factor(self, attribute="factor", index=0):
+        """Mean noise factor of tenant `index`'s requests currently in prefill (1.0 if none or noise disabled)."""
+        tenant = self.tenants[index]
+        factors = [getattr(request, attribute) for request in list(tenant.active.values())
+                   + list(tenant.joining.values()) if request.chunks_left > 0]
         return sum(factors) / len(factors) if factors else 1.0
 
     def recompute_s(self, tenant):
@@ -678,32 +917,35 @@ class Simulator:
 
     def step_duration(self, tenant):
         phase = self.other_phase(tenant)
-        if tenant.index == 0 and any(request.chunks_left > 0 for request in tenant.in_step):
+        other = self.tenants[1 - tenant.index]
+        if any(request.chunks_left > 0 for request in tenant.in_step):
             prompt = max(request.prompt for request in tenant.in_step if request.chunks_left > 0)
             per_100k = self.prefill["solo_s_per_100k"]
             if phase:
                 value = self.prefill["with_other_s_per_100k"]
                 if isinstance(value, dict):
-                    bucket = capture_bucket(max(self.tenants[1].count) or 1)
+                    bucket = capture_bucket(max(other.count) or 1)
                     sizes = sorted(int(size) for size in value)
                     chosen = next((size for size in sizes if bucket <= size), sizes[-1])
                     value = value[str(chosen)] if str(chosen) in value else value[chosen]
-                per_100k = value * self.prefill_factor("prefill_factor")
+                per_100k = value * self.prefill_factor("prefill_factor", tenant.index)
             return per_100k * prompt / 100000 / math.ceil(prompt / CHUNK_TOKENS)
         extra = self.recompute_s(tenant) if self.mode != "full" else 0.0
-        if tenant.index == 1 and phase == "prefill":
-            own = self.truth.decode_step(1, tenant.count, tenant.context, False)
-            return own + self.prefill_factor() * (self.truth.decode_step(1, tenant.count, tenant.context, phase)
-                                                  - own) + extra
+        if phase == "prefill":
+            own = self.truth.decode_step(tenant.index, tenant.count, tenant.context, False)
+            return own + self.prefill_factor("factor", other.index) * (
+                self.truth.decode_step(tenant.index, tenant.count, tenant.context, phase) - own) + extra
         return self.truth.decode_step(tenant.index, tenant.count, tenant.context, phase) + extra
 
     def slice_due(self, slice_cfg):
-        """Periodic slices: (S, R). TTFT-triggered: (T_wait, R, S_max) -- slice when a held Conv request has not
-        started and waited >= T_wait, or the hold lasted >= S_max."""
+        """Periodic slices: (S, R). TTFT-triggered: (T_wait, R, S_max) -- slice when a held request has not started
+        and waited >= T_wait, or the hold lasted >= S_max."""
         held_for = self.now - self.code_run_since
         if len(slice_cfg) == 2:
             return held_for >= slice_cfg[0]
-        waiting = [self.now - request.arrival for request in self.tenants[1].joining.values()]
+        x = self.exclusive()
+        waiting = [self.now - request.arrival for tenant in self.tenants if tenant.index != x
+                   for request in tenant.joining.values()]
         return held_for >= slice_cfg[2] or (waiting and max(waiting) >= slice_cfg[0])
 
     def start_step(self, tenant):
@@ -713,13 +955,17 @@ class Simulator:
             self.admit_waiting(tenant)
         if not tenant.has_work():
             return
-        if tenant.index == 0 and self.spec.get("hold_first") and self.tenants[1].hold_pending:
-            return  # Code waits until Conv reached its pause boundary
-        if tenant.index == 0:
+        x = self.exclusive()
+        if x is None or tenant.index != x:
+            pass
+        elif self.spec.get("hold_first") and any(other.hold_pending for other in self.tenants if other is not tenant):
+            return  # the exclusive tenant waits until the held tenants reached their pause boundary
+        else:
             if tenant.sliced:
                 return
             slice_cfg = self.spec.get("slice")
-            if slice_cfg and self.code_prefilling() and self.tenants[1].held and self.tenants[1].has_work():
+            other = self.tenants[1 - x]
+            if slice_cfg and self.prefilling(x) and other.held and other.has_work():
                 if self.code_run_since is None:
                     self.code_run_since = self.now
                 elif self.slice_armed:
@@ -729,14 +975,12 @@ class Simulator:
                     return
                 elif self.slice_due(slice_cfg):
                     self.slice_armed = True
-            elif not self.code_prefilling():
+            elif not self.prefilling(x):
                 self.code_run_since, self.slice_armed = None, False
         for request in tenant.joining.values():
             tenant.active[request.id] = request
             tenant.count[request.rank] += 1
-            if request.model == 1:
-                request.ctx = request.prompt + request.generated
-            elif request.start_step is not None:
+            if not request.chunked or request.start_step is not None:
                 request.ctx = request.prompt + request.generated
             else:
                 request.ctx = 0.0
@@ -776,6 +1020,8 @@ class Simulator:
                 request.start_step = step
                 if request.first_token_at is None:
                     request.first_token_at = self.now
+                    if self.episode is not None and request.id in self.episode["triggers"]:
+                        self.push(self.now + self.planner_params["tm_grace_s"], "episode_check")
             request.generated += 1
             tenant.context[request.rank] += 1
             request.ctx += 1
@@ -790,10 +1036,13 @@ class Simulator:
             self.pause_reached(tenant)
         elif tenant.hold_pending and (step % self.params["pause_boundary"] == 0 or not tenant.has_work()):
             self.mark_held(tenant)
-            if self.tenants[0].sliced:
-                self.resume_code_slice()
+            x = self.exclusive()
+            if x is None:
+                self.release(tenant)  # the episode ended before this tenant reached its boundary
+            elif self.tenants[x].sliced:
+                self.resume_slice(x)
             else:
-                self.start_step(self.tenants[0])
+                self.start_step(self.tenants[x])
         elif not tenant.paused:
             self.start_step(tenant)
 
@@ -807,10 +1056,16 @@ class Simulator:
             self.set_blocks(tenant, request, 0)
         request.completed_at = self.now
         self.completed.append(request)
-        if self.spec.get("isolate") and request.model == 0 and not tenant.has_work():
-            self.release_conv()
-        if self.spec["return"] and request.model == 0:
-            self.push(self.now + 0.5, "return_check", "release")
+        if self.general:
+            if self.episode is not None and request.id in self.episode["triggers"]:
+                self.push(self.now, "episode_check")
+            if self.spec["return"]:
+                self.push(self.now + 0.5, "return_check", "release")
+        else:
+            if self.spec.get("isolate") and request.model == 0 and not tenant.has_work():
+                self.release_conv()
+            if self.spec["return"] and request.model == 0:
+                self.push(self.now + 0.5, "return_check", "release")
         self.dispatch()
         self.kick()
 
@@ -843,7 +1098,7 @@ class Simulator:
     def move_duration(self, move):
         if self.params["move_s"] is None:
             return self.params["move_fixed_s"] + move["blocks"] * BLOCK_GIB / self.params["copy_gib_s"]
-        prefilling = any(request.chunks_left > 0 for request in self.tenants[0].active.values())
+        prefilling = any(request.chunks_left > 0 for tenant in self.tenants for request in tenant.active.values())
         slow = self.params["move_s_during_code_prefill"]
         return slow if prefilling and slow is not None else self.params["move_s"]
 
@@ -889,12 +1144,16 @@ class Simulator:
                                * (self.now - self.tenants[index].paused_at) for index in transaction["order"])
         admitted = False
         arrival = transaction["arrival"]
-        if arrival is not None and plan.get("target") is not None and self.fits(
-                arrival, plan["target"], self.code_headroom(plan["target"], arrival.prompt) if arrival.model == 0
-                else 0.0):
-            self.queues[arrival.model].remove(arrival)
-            self.admit(arrival, plan["target"], "migration")
-            admitted = True
+        trigger = bool(transaction.get("context", {}).get("trigger"))
+        if arrival is not None and plan.get("target") is not None:
+            if self.general:
+                headroom = self.general_headroom(arrival, trigger)[0][plan["target"]]
+            else:
+                headroom = self.code_headroom(plan["target"], arrival.prompt) if arrival.model == 0 else 0.0
+            if self.fits(arrival, plan["target"], headroom):
+                self.queues[arrival.model].remove(arrival)
+                self.admit(arrival, plan["target"], "migration", trigger)
+                admitted = True
         self.decisions.append({"kind": transaction["kind"], "at": self.now, "moves": len(plan.get("moves", [])),
                                "control_s": self.now - transaction["requested_at"], "admitted": admitted,
                                "paused_request_s": paused_request_s, "target": plan.get("target"),
@@ -911,6 +1170,9 @@ class Simulator:
     def on_return_check(self, reason):
         if reason != "release":
             self.push(self.now + self.params["return_period_s"], "return_check")
+        if self.general:
+            self.general_return()
+            return
         if (self.transaction is not None or any(self.queues)
                 or self.now - self.last_return < self.params["return_cooldown_s"]
                 or (self.mode == "full" and not self.all_decoding((1,)))):
@@ -928,6 +1190,25 @@ class Simulator:
 
         if plan_fn()["moves"]:
             self.start_transaction("return", plan_fn, pause_models=(1,))
+
+    def general_return(self):
+        """Algorithm 3 (§5.4): level every tenant; never during an episode or a long prefill."""
+        if (self.transaction is not None or any(self.queues)
+                or self.now - self.last_return < self.params["return_cooldown_s"]
+                or self.episode is not None or self.long_prefill_in_flight()):
+            return
+        if not any(max(tenant.count) - min(tenant.count) >= 2 for tenant in self.tenants):
+            return
+        return_params = dict(self.planner_params, return_tenants=(0, 1), **self.risk_params())
+
+        def plan_fn():
+            growth, _ = self.general_growth()
+            state = build_state(self.observed(), self.budgets, slack_gib=self.slack_gib(), request_growth=growth)
+            return plan_return(state, self.belief, return_params)
+
+        moves = plan_fn()["moves"]
+        if moves:
+            self.start_transaction("return", plan_fn, pause_models=sorted({move["model"] for move in moves}))
 
     def on_population(self, _):
         self.population.append({"t": self.now, "counts": [list(tenant.count) for tenant in self.tenants],

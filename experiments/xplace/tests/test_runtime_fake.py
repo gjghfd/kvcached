@@ -390,11 +390,33 @@ def test_slo_aware_slicing_triggers_on_waiting_conv(tmp_path, monkeypatch):
     assert len(requests) == 25 and all(r["output_tokens"] == (64 if r["model"] == 0 else 300) for r in requests)
 
 
-def test_no_headroom_ablation_disables_growth_allowance(tmp_path):
-    """The *_nh ablation must admit with zero growth headroom; the default keeps per-Conv growth + slack."""
-    captured = {}
+@pytest.mark.parametrize("policy", ["no_move_tm_slo", "mig_random_tm_slo", "ca_admit_tm_slo", "ca_return_tm_slo",
+                                    "ca_full_tm_slo_v1", "no_move_tm_slo_nh"])
+def test_final_scheme_ablations_run_to_completion(tmp_path, monkeypatch, policy):
+    import trace_runner
 
-    async def scenario(policy):
+    monkeypatch.setitem(trace_runner.POLICIES, policy, dict(trace_runner.POLICIES[policy], slice=(0.02, 0.01, 5.0)))
+
+    async def scenario():
+        engines = [FakeTenant(0, RANKS, 0.002, chunk_tokens=128), FakeTenant(1, RANKS, 0.002)]
+        engines[1].peer = engines[0]
+        controller = PlacementController(engines, RANKS, [40.0] * RANKS)
+        summary = await run_trace(engines, controller, streaming_trace(), PROMPTS, policy, tmp_path / policy,
+                                  trace_args(monitor_s=0.5, poll_s=0.002))
+        return summary, controller, engines[1].overlap_steps
+
+    summary, controller, overlap = asyncio.run(scenario())
+    assert summary["status"] == "passed", summary
+    assert summary["holds"] >= 1 and not controller.held, summary
+    if trace_runner.POLICIES[policy].get("hold_first"):  # v1 admits Code before Conv reaches its pause boundary
+        assert overlap == 0, overlap
+    requests = json.loads((tmp_path / policy / "requests.json").read_text())
+    assert len(requests) == 25 and all(r["output_tokens"] == (64 if r["model"] == 0 else 300) for r in requests)
+
+
+def first_code_headroom(tmp_path, policy, planner_overrides=None):
+    """Per-rank headroom of the first Code direct-admission attempt, and the trial summary."""
+    async def scenario():
         engines = make_engines()
         link_gpu(engines)
         controller = PlacementController(engines, RANKS, [10.0] * RANKS)
@@ -404,20 +426,37 @@ def test_no_headroom_ablation_disables_growth_allowance(tmp_path):
         async def spy(model, tokens, admit, route=None, before_admit=None, headroom=None):
             report = await direct(model, tokens, admit, route, before_admit, headroom)
             if model == 0:
-                seen.append(report.get("headroom_gib"))
+                seen.append((report.get("headroom_gib"), report.get("counts")))
             return report
 
         controller.try_direct_admission = spy
         args = trace_args(kv_mode="prompt", reserve_extra_tokens=0, monitor_s=0.02)
-        summary = await run_trace(engines, controller, long_output_trace(), PROMPTS, policy, tmp_path / policy, args)
+        args.planner_params = dict(args.planner_params, **(planner_overrides or {}))
+        label = policy + "".join(f"-{value}" for value in (planner_overrides or {}).values())
+        summary = await run_trace(engines, controller, long_output_trace(), PROMPTS, policy, tmp_path / label, args)
         return summary, seen
 
-    for policy in ("ca_full_tm_slo", "ca_full_tm_slo_nh"):
-        summary, seen = asyncio.run(scenario(policy))
-        assert summary["status"] == "passed", summary
-        captured[policy] = seen[0]
-    assert all(value == 0.0 for value in captured["ca_full_tm_slo_nh"])
-    assert any(value > 0.0 for value in captured["ca_full_tm_slo"])
+    summary, seen = asyncio.run(scenario())
+    assert summary["status"] == "passed", summary
+    return seen[0]
+
+
+@pytest.mark.parametrize("base,ablated", [("ca_full_tm_slo", "ca_full_tm_slo_nh"), ("no_move_v2", "no_move_v2_nh"),
+                                          ("no_move_tm_slo", "no_move_tm_slo_nh")])
+def test_no_headroom_ablation_disables_growth_allowance(tmp_path, base, ablated):
+    """The *_nh variants must admit with zero growth headroom; the default keeps per-Conv growth + slack."""
+    assert all(value == 0.0 for value in first_code_headroom(tmp_path, ablated)[0])
+    assert any(value > 0.0 for value in first_code_headroom(tmp_path, base)[0])
+
+
+def test_relief_scope_destinations_drops_the_floor_on_the_code_rank(tmp_path):
+    """Under a plain hold, Conv on the Code's rank does not grow: with relief_scope "destinations" the Code's rank
+    only keeps the slack page, while the default also keeps the relief floor for every Conv there."""
+    slack = {"slack_pages": 1}
+    floor, counts = first_code_headroom(tmp_path, "no_move_tm_v2", dict(slack, relief_scope="all"))
+    scoped, _ = first_code_headroom(tmp_path, "no_move_tm_v2", dict(slack, relief_scope="destinations"))
+    assert len(set(scoped)) == 1 and scoped[0] > 0.0
+    assert all(value > scoped[0] for value, conv in zip(floor, counts[1]) if conv > 0)
 
 
 def test_no_return_rebalance_while_a_code_is_resident(tmp_path):

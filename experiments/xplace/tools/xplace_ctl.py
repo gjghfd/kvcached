@@ -2,10 +2,12 @@
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import tarfile
 import time
+import uuid
 from pathlib import Path
 
 XPLACE = Path(__file__).resolve().parents[1]
@@ -59,21 +61,42 @@ def build(tag, inputs):
     return record
 
 
-def upload(tag):
+def upload(tag, resume=False):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", tag):
+        raise ValueError("Invalid upload tag")
     root = STAGING / tag
     record = json.loads((root / "build.json").read_text())
-    remote(f'if [ -e "{REMOTE}/{tag}" ]; then echo "remote tag exists" >&2; exit 3; fi\n'
-           f'mkdir -p "{REMOTE}/{tag}/logs"\n')
-    subprocess.run(["scp", "-q", "-o", "BatchMode=yes", str(root / "upload.tar.gz"),
-                    f"paracloud:{REMOTE_RELATIVE}/{tag}/upload.tar.gz"], check=True, timeout=1800)
-    output = remote(f'cd "{REMOTE}/{tag}"\n'
-                    f'test "$(sha256sum upload.tar.gz | cut -d" " -f1)" = "{record["tarball_sha256"]}"\n'
-                    'tar xzf upload.tar.gz\n'
-                    'chmod -R a-w upload\n'
-                    'cd upload && sha256sum -c --quiet MANIFEST.sha256 && echo VERIFIED\n')
-    if "VERIFIED" not in output:
-        raise RuntimeError(f"Remote manifest verification failed: {output}")
+    if sha256(root / "upload.tar.gz") != record["tarball_sha256"]:
+        raise ValueError("Frozen local tarball SHA mismatch")
+    base = f"{REMOTE}/{tag}"
+    if not resume:
+        remote(f'if [ -e "{base}" ]; then echo "remote tag exists" >&2; exit 3; fi\n'
+               f'mkdir -p "{base}/logs"\n')
+    remote(f'test -d "{base}"\n'
+           f'test ! -e "{base}/upload"\n'
+           f'test -z "$(find "{base}" -maxdepth 1 -name "job-*" -print -quit)"\n'
+           f'mkdir "{base}/.upload-lock"\n')
+    partial = "upload.tar.gz.part-" + uuid.uuid4().hex
+    try:
+        with (root / "upload.tar.gz").open("rb") as stream:
+            subprocess.run(SSH + [f'umask 077; cat > "{base}/{partial}"'], stdin=stream,
+                           check=True, timeout=1800)
+        output = remote(f'cd "{base}"\n'
+                        f'test "$(sha256sum {partial} | cut -d" " -f1)" = "{record["tarball_sha256"]}"\n'
+                        f'tar xzf {partial}\n'
+                        'cd upload\n'
+                        f'test "$(sha256sum MANIFEST.sha256 | cut -d" " -f1)" = "{record["manifest_sha256"]}"\n'
+                        'sha256sum -c --quiet MANIFEST.sha256\n'
+                        'cd .. && chmod -R a-w upload\n'
+                        f'if [ -e upload.tar.gz ]; then mv upload.tar.gz upload.tar.gz.previous-{partial}; fi\n'
+                        f'mv {partial} upload.tar.gz\n'
+                        'echo VERIFIED\n')
+        if "VERIFIED" not in output:
+            raise RuntimeError(f"Remote manifest verification failed: {output}")
+    finally:
+        remote(f'rmdir "{base}/.upload-lock"', check=False)
     record["uploaded_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    record["upload_transport"] = "ssh_stdin_verified_atomic_publish"
     (root / "build.json").write_text(json.dumps(record, indent=2) + "\n")
     return record
 
@@ -138,6 +161,7 @@ def main():
     command.add_argument("--inputs", type=Path, nargs="*", default=[])
     command = sub.add_parser("upload")
     command.add_argument("tag")
+    command.add_argument("--resume", action="store_true")
     command = sub.add_parser("submit")
     command.add_argument("tag")
     command.add_argument("--time", required=True)
@@ -153,7 +177,7 @@ def main():
     if args.command == "build":
         print(json.dumps(build(args.tag, args.inputs), indent=2))
     elif args.command == "upload":
-        print(json.dumps(upload(args.tag), indent=2))
+        print(json.dumps(upload(args.tag, args.resume), indent=2))
     elif args.command == "submit":
         env = dict(item.split("=", 1) for item in args.env)
         print(json.dumps(submit(args.tag, env, args.time, args.job_name, args.dependency, args.exclude), indent=2))

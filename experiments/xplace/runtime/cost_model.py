@@ -66,6 +66,20 @@ class StepModel:
             return step + float(phase[str(chosen)] if str(chosen) in phase else phase[chosen])
         return step + float(phase)
 
+    def prefill_s_per_token(self, tenant, co_bucket=None):
+        """Seconds per prompt token of `tenant`'s chunked prefill: alone, or while another tenant runs with its
+        largest per-rank batch in CUDA graph bucket `co_bucket`. Per-tenant "prefill" params override the shared
+        calibration (both tenants here serve the same model)."""
+        params = self.params.get("prefill", {}).get(str(tenant)) or self.params.get("code_prefill") or {}
+        if co_bucket is None:
+            return float(params.get("solo_s_per_100k", 26.4)) / 1e5
+        value = params.get("with_other_s_per_100k", 54.0)
+        if isinstance(value, dict):
+            sizes = sorted(int(size) for size in value)
+            chosen = next((size for size in sizes if co_bucket <= size), sizes[-1])
+            value = value[str(chosen)] if str(chosen) in value else value[chosen]
+        return float(value) / 1e5
+
     def placement_terms(self, tenant, counts, contexts):
         """Layout-dependent part of the step (what placement can change)."""
         params = self.tenants[tenant]
@@ -82,7 +96,8 @@ def completion_segments(remaining, max_segments=16):
     return thresholds
 
 
-def integrated_cost(model, tenant, requests, num_ranks, horizon_steps=None, max_segments=16, other_active=False):
+def integrated_cost(model, tenant, requests, num_ranks, horizon_steps=None, max_segments=16, other_active=False,
+                    other_bucket=None):
     """Request-seconds of decode time for (rank, context, remaining) requests until completion or horizon.
 
     Assumes no arrivals or moves; each alive request advances one token per step.
@@ -106,7 +121,9 @@ def integrated_cost(model, tenant, requests, num_ranks, horizon_steps=None, max_
         for rank, context, remaining in current:
             counts[rank] += 1
             contexts[rank] += context + min(middle, remaining)
-        total += steps * len(current) * model.decode_step(tenant, counts, contexts, other_active)
+        step = (model.decode_step(tenant, counts, contexts, other_active) if other_bucket is None else
+                model.decode_step(tenant, counts, contexts, other_active, other_bucket))
+        total += steps * len(current) * step
         previous = threshold
     return total
 

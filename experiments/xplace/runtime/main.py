@@ -8,42 +8,43 @@ import time
 import traceback
 from pathlib import Path
 
-PHASES = ("dataplane", "grid", "interference", "ilayout", "fit", "trace")
+from parallel_topology import minimum_free_bytes, verify_workers
+
+PHASES = ("dataplane", "grid", "imbalance", "interference", "observability", "causal", "ilayout", "fit", "trace")
 
 
-def verify_topology(output, num_ranks):
-    workers = [[json.loads((output / f"worker-instance-{model + 1}-dp{rank}.json").read_text())
-                for rank in range(num_ranks)] for model in (0, 1)]
-    for model in workers:
-        for worker in model:
-            sizes = {name: worker["groups"][name]["world_size"] for name in ("tp", "dp", "ep")}
-            if sizes != {"tp": 1, "dp": num_ranks, "ep": num_ranks}:
-                raise RuntimeError(f"Unexpected parallel topology {sizes}")
-        for layer in range(len(model[0]["expert_ids"])):
-            shards = [set(worker["expert_ids"][layer]) for worker in model]
-            if sum(map(len, shards)) != 128 or set().union(*shards) != set(range(128)):
-                raise RuntimeError("Experts are not complementary EP shards")
-    if any(workers[0][rank]["gpu_uuid"] != workers[1][rank]["gpu_uuid"] for rank in range(num_ranks)):
-        raise RuntimeError("Tenant DP ranks are not colocated on the same GPUs")
-    if len({worker["ipc_name"] for model in workers for worker in model}) != 2 * num_ranks:
-        raise RuntimeError("Tenant/rank KV namespaces are not independent")
-    return {"num_ranks": num_ranks, "gpu_uuids": [worker["gpu_uuid"] for worker in workers[0]],
-            "parameter_gib": [[worker["parameter_bytes"] / 1024**3 for worker in model] for model in workers],
-            "kv_num_blocks": [[worker["kv_num_blocks"] for worker in model] for model in workers]}
+def verify_topology(output, num_ranks, tensor_parallel_size=1):
+    return verify_workers(output, num_ranks, tensor_parallel_size)
 
 
 async def measure_budget(controller, margin_gib, cap_gib=None):
     from controller import GIB
 
+    requested_at = time.monotonic()
     memory = await controller.memory(release_unused=True)
+    memory_received_at = time.monotonic()
     summaries = await controller.summaries()
+    summaries_received_at = time.monotonic()
     natural = []
+    calculations = []
+    tensor_parallel_size = getattr(controller, "tensor_parallel_size", 1)
     for rank in range(controller.num_ranks):
-        free = min(memory[model][rank][0]["free_mib"] for model in (0, 1)) * 1024**2
-        mapped = sum(summaries[model][rank]["mapped_bytes"] for model in (0, 1))
-        natural.append(math.floor(((mapped + free) / GIB - margin_gib) * 4) / 4)
+        free = minimum_free_bytes(memory, rank, tensor_parallel_size)
+        mapped_by_model = [summaries[model][rank]["mapped_bytes"] for model in (0, 1)]
+        if any(type(value) is not int or value < 0 for value in mapped_by_model):
+            raise ValueError("Invalid mapped-KV capacity input")
+        mapped = sum(mapped_by_model)
+        unrounded = (mapped + free) / GIB - margin_gib
+        natural.append(math.floor(unrounded * 4) / 4)
+        calculations.append(dict(rank=rank, minimum_free_bytes=free, mapped_bytes_by_model=mapped_by_model,
+                                 mapped_bytes=mapped, unrounded_budget_gib=unrounded,
+                                 rounded_budget_gib=natural[-1]))
     budgets = [min(value, cap_gib) if cap_gib else value for value in natural]
-    return {"memory": memory, "natural_budget_gib": natural, "budget_gib": budgets, "margin_gib": margin_gib}
+    return {"memory": memory, "natural_budget_gib": natural, "budget_gib": budgets, "margin_gib": margin_gib,
+            "capacity_schema": 1, "num_ranks": controller.num_ranks, "tensor_parallel_size": tensor_parallel_size,
+            "summary_snapshots": summaries, "rank_calculations": calculations,
+            "measurement_times": dict(memory_requested_at=requested_at, memory_received_at=memory_received_at,
+                                      summaries_received_at=summaries_received_at)}
 
 
 async def run_phases(engines, args, bank, bank_sha, mark, verify=True):
@@ -57,11 +58,23 @@ async def run_phases(engines, args, bank, bank_sha, mark, verify=True):
     output = args.output
     phases = [phase for phase in args.phases.split(",") if phase]
     controller = PlacementController(engines, args.num_ranks, [1e6] * args.num_ranks)
+    controller.tensor_parallel_size = getattr(args, "tensor_parallel_size", 1)
     await controller.summaries()
-    topology = verify_topology(output, args.num_ranks) if verify else None
+    topology = verify_topology(output, args.num_ranks, controller.tensor_parallel_size) if verify else None
+    if ("causal" in phases or os.environ.get("XPLACE_SCAN_OVERHEAD") == "1") and verify:
+        from causal_deployment import verify_worker_attestations
+
+        save(output / "causal-worker-attestations.json",
+             verify_worker_attestations(output, os.environ["XPLACE_CAUSAL_MANIFEST_SHA256"]))
     budget = await measure_budget(controller, args.budget_margin_gib, args.budget_cap_gib)
-    controller.budgets = list(budget["natural_budget_gib"])
+    if "causal" in phases:
+        from causal_calibration import bind_paired_budget
+
+        budget = bind_paired_budget(budget, args.causal_plan)
     save(output / "budget.json", budget)
+    if "causal" in phases and budget["paired_budget_status"] != "verified":
+        raise ValueError("Natural capacity cannot satisfy the frozen paired budget")
+    controller.budgets = list(budget["budget_gib"] if "causal" in phases else budget["natural_budget_gib"])
     for model in (0, 1):
         for rank in range(args.num_ranks):
             await stream(engines[model], f"warm_{model}_{rank}", list(range(1000, 1064)), 16, rank, model,
@@ -84,7 +97,12 @@ async def run_phases(engines, args, bank, bank_sha, mark, verify=True):
              window=result.get("window"))
         if not healthy:
             raise RuntimeError(f"Slow node: probe step {step_ms} ms exceeds {args.probe_max_ms} ms")
-    step_params = json.loads(args.step_params.read_text()) if args.step_params else default_dp2_params()
+    if controller.tensor_parallel_size > 1 and "trace" in phases:
+        from measured_cost import load_measured_cost
+
+        step_params = load_measured_cost(args.step_params, args.num_ranks, controller.tensor_parallel_size)
+    else:
+        step_params = json.loads(args.step_params.read_text()) if args.step_params else default_dp2_params()
     calibration = output / "calibration"
     calibration.mkdir(exist_ok=True)
     grid = interference = None
@@ -96,11 +114,34 @@ async def run_phases(engines, args, bank, bank_sha, mark, verify=True):
         elif phase == "grid":
             grid = await run_conv_grid(engines, controller, calibration, args.num_ranks)
             mark(phase, "passed", measured=sum(case["status"] == "measured" for case in grid))
+        elif phase == "imbalance":
+            from imbalance_calibration import run_imbalance_scan
+
+            config = json.loads(args.imbalance_config.read_text())
+            result = await run_imbalance_scan(engines, controller, calibration / "imbalance", config, args.num_ranks)
+            mark(phase, result["status"], measured=result["measured"], planned=result["planned"])
+            if result["status"] != "passed":
+                raise RuntimeError(f"Incomplete imbalance calibration: {result}")
         elif phase == "interference":
             code_key = sorted(key for key in bank if key.startswith("swe-"))[0]
             interference = await run_interference(engines, controller, calibration, bank[code_key],
                                                   args.num_ranks)
             mark(phase, "passed")
+        elif phase == "observability":
+            from timing_calibration import run_observability
+
+            code_key = sorted(key for key in bank if key.startswith("swe-"))[0]
+            result = await run_observability(engines, controller, calibration / "observability", bank[code_key],
+                                             args.timing_deadline)
+            mark(phase, result["status"], cases=len(result["completed"]))
+        elif phase == "causal":
+            from causal_calibration import run_causal_calibration
+
+            result = await asyncio.wait_for(
+                run_causal_calibration(engines, controller, calibration / "causal", bank, args.causal_plan,
+                                       args.causal_mode, args.causal_live_root, args.timing_deadline),
+                timeout=max(0.0, args.timing_deadline - time.monotonic()))
+            mark(phase, result["status"], cases=len(result["completed"]), prediction_gate_passed=False)
         elif phase == "ilayout":
             from calibrate import INTERFERENCE_LAYOUTS, run_interference_layouts
 
@@ -139,6 +180,7 @@ async def run_phases(engines, args, bank, bank_sha, mark, verify=True):
                     drain_timeout_s=args.drain_timeout_s,
                     kv_utilization=float(os.environ.get("KVCACHED_GPU_UTILIZATION", "0.95")),
                     kv_mode=getattr(args, "kv_mode", "full"),
+                    max_inflight=getattr(args, "max_inflight", (0, 0)),
                     reserve_extra_tokens=getattr(args, "reserve_extra_tokens", 0))
                 # a labelled segment writes trace/<label>/<policy> and marks <label>/<policy>
                 root = output / "trace" if label is None else output / "trace" / label
@@ -207,9 +249,45 @@ async def run(args):
     os.environ["DP_OPT_EVIDENCE_ROOT"] = str(output)
     os.environ["DP_OPT_CONTROLLED_RESERVATION_RETRY"] = "1"
     os.environ["DP_OPT_CAPTURE_EVIDENCE"] = "0"
+    os.environ["XPLACE_GRAPH_EXECUTION_ALLOWED"] = "0"
+    if "imbalance" in phases:
+        graph_config = json.loads(args.imbalance_config.read_text())
+        if graph_config.get("observe_graph_execution") is True:
+            os.environ["XPLACE_GRAPH_EXECUTION_ALLOWED"] = "1"
+    os.environ["XPLACE_TIMING_ALLOWED"] = "1" if "observability" in phases else "0"
+    from timing_probe import nested_timing_enabled
+    if nested_timing_enabled() and "observability" not in phases:
+        raise ValueError("Nested timing is restricted to the observability pilot")
+    if "observability" in phases or "causal" in phases:
+        from timing_calibration import allocation_deadline
+
+        args.timing_deadline = allocation_deadline()
+    if "causal" in phases:
+        from causal_calibration import configure_collection, load_plan
+
+        args.causal_plan = load_plan(args.causal_config, args.prompt_bank)
+        args.causal_live_root = Path(os.environ["DP_OPT_TRANSFER_ROOT"]) / "causal-live"
+        configure_collection(args.causal_mode, args.causal_live_root)
     bank, bank_sha = load_bank(args.prompt_bank)
     engines = []
     try:
+        if os.environ.get("XPLACE_SCAN_OVERHEAD") == "1" and phases != ["dataplane", "imbalance"]:
+            raise ValueError("Scan overhead source attestation is restricted to dataplane,imbalance")
+        if "causal" in phases or os.environ.get("XPLACE_SCAN_OVERHEAD") == "1":
+            from causal_deployment import frontend_attestation
+
+            save(output / "causal-frontend-attestation.json", frontend_attestation())
+        if "observability" in phases:
+            import vllm
+            from timing_probe import verify_interface_sources
+
+            try:
+                source_sha256 = verify_interface_sources(Path(vllm.__file__).parent,
+                                                         **({"nested": True} if nested_timing_enabled() else {}))
+                save(output / "timing-interface-check.json", {"status": "passed", "source_sha256": source_sha256})
+            except (OSError, ValueError) as error:
+                save(output / "timing-interface-check.json", {"status": "failed", "error": str(error)})
+                raise
         mark("startup", "started")
         job = os.environ.get("SLURM_JOB_ID", "local")
         for model in (0, 1):
@@ -218,7 +296,9 @@ async def run(args):
             os.environ["KVCACHED_IPC_NAME"] = base
             os.environ["KVCACHED_DP_IPC_BASE"] = base
             engines.append(AsyncLLM.from_engine_args(engine_arguments(
-                args.checkpoint, args.port + 100 * model, args.cache_bytes, args.max_model_len, args.num_ranks)))
+                args.checkpoint, args.port + 100 * model, args.cache_bytes, args.max_model_len, args.num_ranks,
+                tensor_parallel_size=args.tensor_parallel_size,
+                enable_tp_migration=args.enable_tp_migration)))
         await run_phases(engines, args, bank, bank_sha, mark)
         mark("job", "passed")
     except BaseException as error:
@@ -229,6 +309,14 @@ async def run(args):
     finally:
         for engine in reversed(engines):
             engine.shutdown()
+    if "causal" in phases or os.environ.get("XPLACE_SCAN_OVERHEAD") == "1":
+        try:
+            save(output / "causal-final-attestation.json", frontend_attestation())
+        except BaseException as error:
+            save(output / "causal-final-attestation-error.json",
+                 {"type": type(error).__name__, "message": str(error)})
+            mark("job", "failed", error=f"Final source verification: {error}")
+            raise
 
 
 def parse_args(argv=None):
@@ -240,6 +328,8 @@ def parse_args(argv=None):
     parser.add_argument("--phases", default="dataplane,grid,interference,fit,trace")
     parser.add_argument("--policies", default="no_move,ca_full")
     parser.add_argument("--num-ranks", type=int, default=4)
+    parser.add_argument("--tensor-parallel-size", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--enable-tp-migration", action="store_true")
     parser.add_argument("--port", type=int, default=31000)
     parser.add_argument("--cache-bytes", type=int, default=48 * 1024**3)
     parser.add_argument("--max-model-len", type=int, default=131072)
@@ -256,11 +346,71 @@ def parse_args(argv=None):
                              "output length); prompt = current length only, per-step growth, vLLM retract")
     parser.add_argument("--reserve-extra-tokens", type=int, default=0,
                         help="fixed tokens reserved beyond the prompt under --kv-mode prompt")
+    parser.add_argument("--max-inflight", type=int, nargs=2, default=(0, 0), metavar=("MODEL0", "MODEL1"),
+                        help="shared per-model submitted-request limits for every policy; 0 means unlimited")
     parser.add_argument("--segments", type=Path,
                         help="JSON list of {label, trace, budget_cap_gib, policies} run in order (replaces --trace)")
+    parser.add_argument("--imbalance-config", type=Path, help="Dense fixed-context decode calibration JSON")
+    parser.add_argument("--causal-config", type=Path, help="Frozen training-only causal collection plan")
+    parser.add_argument("--causal-mode", choices=("off", "producers", "collect"))
     args = parser.parse_args(argv)
+    if any(value < 0 for value in args.max_inflight):
+        parser.error("--max-inflight limits must be nonnegative")
     if "trace" in args.phases.split(",") and args.trace is None and args.segments is None:
         parser.error("--trace or --segments is required for the trace phase")
+    if "imbalance" in args.phases.split(",") and args.imbalance_config is None:
+        parser.error("--imbalance-config is required for the imbalance phase")
+    phases = args.phases.split(",")
+    if "causal" in phases:
+        if (args.phases != "dataplane,causal" or args.tensor_parallel_size != 2 or args.num_ranks != 2
+                or not args.enable_tp_migration or args.causal_config is None or args.causal_mode is None
+                or args.kv_mode != "prompt" or args.budget_cap_gib is not None or args.budget_margin_gib != 3.0):
+            parser.error("Causal training requires dataplane,causal, DP2/TP2, prompt mode, frozen paired budget and a plan/mode")
+        from causal_calibration import load_plan
+
+        try:
+            plan = load_plan(args.causal_config, args.prompt_bank)
+            if (args.reserve_extra_tokens != plan["reserve_extra_tokens"]
+                    or list(args.max_inflight) != plan["max_inflight"]
+                    or args.drain_timeout_s != plan["drain_timeout_s"] or args.seed != 20261110
+                    or args.max_model_len != 131072 or args.cache_bytes != 48 * 1024**3):
+                raise ValueError("Causal CLI configuration differs from the fixed training protocol")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            parser.error(str(error))
+    if "observability" in phases and (args.phases != "dataplane,observability" or args.tensor_parallel_size != 2
+                                      or args.num_ranks != 2 or not args.enable_tp_migration):
+        parser.error("Observability requires only dataplane,observability with DP2/TP2 migration enabled")
+    if args.enable_tp_migration and (args.tensor_parallel_size != 2 or args.num_ranks != 2):
+        parser.error("Experimental TP migration requires DP2/TP2/EP4")
+    if args.tensor_parallel_size > 1:
+        if args.num_ranks != 2:
+            parser.error("TP2 requires DP2/EP4 on four GPUs")
+        if not args.enable_tp_migration and args.phases != "imbalance":
+            parser.error("TP2 migration/trace requires explicit opt-in and a same-job dataplane gate")
+        if args.enable_tp_migration:
+            if any(phase not in ("dataplane", "imbalance", "grid", "interference", "observability", "causal", "trace") for phase in phases):
+                parser.error("Unvalidated TP2 calibration phase")
+            if "dataplane" not in phases or ("trace" in phases and phases.index("dataplane") > phases.index("trace")):
+                parser.error("TP2 trace requires a preceding same-job dataplane phase")
+            if "trace" in phases and (args.kv_mode != "prompt" or args.step_params is None):
+                parser.error("TP2 trace requires current-length admission and measured step parameters")
+            if "trace" in phases:
+                from measured_cost import load_measured_cost
+
+                try:
+                    load_measured_cost(args.step_params, args.num_ranks, args.tensor_parallel_size)
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    parser.error(f"Invalid measured TP2 cost: {error}")
+    if "imbalance" in args.phases.split(","):
+        from imbalance_calibration import scan_cases
+
+        try:
+            config = json.loads(args.imbalance_config.read_text())
+            scan_cases(config, args.num_ranks, args.tensor_parallel_size)
+            if config["context_tokens"] + config["output_tokens"] > args.max_model_len:
+                raise ValueError("Calibration request exceeds --max-model-len")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            parser.error(str(error))
     return args
 
 

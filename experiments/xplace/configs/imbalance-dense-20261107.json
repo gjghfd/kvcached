@@ -1,0 +1,13 @@
+{
+  "seed": 20261107,
+  "context_tokens": 4096,
+  "output_tokens": 1024,
+  "repeats": 2,
+  "case_timeout_s": 120,
+  "max_scan_s": 2800,
+  "series": [
+    {"batch_size": 32, "deltas": [0, 1, 2, 3, 4, 5, 6, 7, 8]},
+    {"batch_size": 64, "deltas": [0, 1, 2, 4, 6, 8, 10, 12, 14, 16]},
+    {"batch_size": 128, "deltas": [0, 1, 2, 4, 8, 12, 16, 20, 24, 28, 32]}
+  ]
+}

@@ -39,7 +39,24 @@ COMPARISONS = (("no_move", "mig_random"), ("no_move", "ca_full"), ("no_move_fair
                ("mig_random_v2", "mig_random_tm_v2"), ("mig_random_tm_v2", "ca_full_tm_v2"),
                ("no_move_v2", "ca_full_tm_slo"), ("no_move_tm_v2", "ca_full_tm_v2"),
                ("ca_full_v2_nh", "ca_full_v2"), ("ca_full_tm_slo_nh", "ca_full_tm_slo"),
-               ("mig_random_v2", "ca_full_v2_nh"), ("ca_full_tm_s4", "ca_full_tm_slo"))
+               ("mig_random_v2", "ca_full_v2_nh"), ("ca_full_tm_s4", "ca_full_tm_slo"),
+               # ablations of the final scheme: each variant -> ca_full_tm_slo
+               ("no_move_tm_slo", "ca_full_tm_slo"), ("mig_random_tm_slo", "ca_full_tm_slo"),
+               ("ca_admit_tm_slo", "ca_full_tm_slo"), ("ca_return_tm_slo", "ca_full_tm_slo"),
+               ("ca_full_tm_slo_v1", "ca_full_tm_slo"), ("mig_random_tm_slo", "ca_return_tm_slo"),
+               ("mig_random_tm_slo", "ca_admit_tm_slo"),
+               # baselines without growth headroom
+               ("no_move_v2_nh", "ca_full_tm_slo"), ("no_move_tm_slo_nh", "ca_full_tm_slo"),
+               ("no_move_v2", "no_move_v2_nh"), ("no_move_tm_slo", "no_move_tm_slo_nh"),
+               ("kvcached_native", "no_move_v2_nh"),
+               # general (type-agnostic) algorithm *_g: overall, migration, placement, headroom, scheduling
+               ("no_move_v2_nh_g", "ca_full_tm_slo_g"), ("no_move_tm_slo_nh_g", "ca_full_tm_slo_g"),
+               ("mig_random_tm_slo_g", "ca_full_tm_slo_g"), ("ca_admit_tm_slo_g", "ca_full_tm_slo_g"),
+               ("ca_return_tm_slo_g", "ca_full_tm_slo_g"), ("mig_random_tm_slo_g", "ca_admit_tm_slo_g"),
+               ("mig_random_tm_slo_g", "ca_return_tm_slo_g"), ("ca_full_tm_slo_nh_g", "ca_full_tm_slo_g"),
+               ("ca_full_tm_v2_g", "ca_full_tm_slo_g"), ("ca_full_v2_g", "ca_full_tm_slo_g"),
+               ("no_move_v2_nh_g", "no_move_tm_slo_nh_g"), ("no_move_v2_nh_g", "ca_full_v2_g"),
+               ("ca_full_tm_slo", "ca_full_tm_slo_g"))
 
 
 def summarize(values):

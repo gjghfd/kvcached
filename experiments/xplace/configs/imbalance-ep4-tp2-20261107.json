@@ -1,0 +1,15 @@
+{
+  "num_ranks": 2,
+  "tensor_parallel_size": 2,
+  "seed": 20261107,
+  "context_tokens": 4096,
+  "output_tokens": 1024,
+  "repeats": 3,
+  "case_timeout_s": 120,
+  "max_scan_s": 3100,
+  "series": [
+    {"batch_size": 32, "deltas": [0, 1, 2, 4, 8, 12, 16]},
+    {"batch_size": 64, "deltas": [0, 1, 2, 4, 8, 16, 24, 32]},
+    {"batch_size": 128, "deltas": [0, 1, 2, 4, 8, 16, 32, 48, 64]}
+  ]
+}

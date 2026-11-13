@@ -1,0 +1,66 @@
+{
+  "num_ranks": 4,
+  "tensor_parallel_size": 1,
+  "seed": 20261108,
+  "context_tokens": 4096,
+  "output_tokens": 1024,
+  "repeats": 1,
+  "repeat_start": 1,
+  "case_timeout_s": 150,
+  "max_scan_s": 3000,
+  "series": [
+    {
+      "batch_size": 128,
+      "deltas": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        6,
+        8,
+        10,
+        12,
+        14,
+        16,
+        18,
+        20,
+        24,
+        28,
+        30,
+        32
+      ]
+    },
+    {
+      "batch_size": 192,
+      "deltas": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        6,
+        8,
+        10,
+        12,
+        14,
+        16,
+        18,
+        20,
+        22
+      ]
+    },
+    {
+      "batch_size": 256,
+      "deltas": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ]
+    }
+  ]
+}

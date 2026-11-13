@@ -36,7 +36,7 @@ def transfer_geometry(views, blocks, num_blocks, source_rank, destination_rank, 
 def transfer_blocks(worker, views, blocks, source_rank, destination_rank, num_blocks, chunk_mib):
     """Copy KV blocks source->destination over the DP group; every DP rank must call this collectively."""
     import torch
-    from vllm.distributed.parallel_state import get_dp_group
+    from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 
     group = get_dp_group()
     rank, world = group.rank_in_group, group.world_size
@@ -97,7 +97,8 @@ def transfer_blocks(worker, views, blocks, source_rank, destination_rank, num_bl
         if not bool(acknowledged[0].all().item()):
             raise RuntimeError("Peer destination KV differs bytewise from source")
         mark("acknowledgment")
-    return {"role": role, "rank": rank, "bytes": geometry["bytes"], "num_blocks": num_blocks,
+    return {"role": role, "rank": rank, "tp_rank": get_tp_group().rank_in_group,
+            "tp_size": get_tp_group().world_size, "bytes": geometry["bytes"], "num_blocks": num_blocks,
             "stage_s": stage_s, "elapsed_s": time.monotonic() - started, "chunk_mib": chunk_mib,
             "bitwise_verified": True, "integrity": "device_echo_full_bytewise",
             "transport": "dp_allgatherv_source_broadcast_destination_echo"}

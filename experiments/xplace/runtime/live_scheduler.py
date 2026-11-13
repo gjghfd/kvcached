@@ -10,6 +10,8 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.request import RequestStatus
 
+from scoring_state import request_phase
+
 
 def unique_views(runner):
     views, seen = [], set()
@@ -29,6 +31,7 @@ def unique_views(runner):
 
 def kv_file(worker, operation, blocks, filename):
     import torch
+    from vllm.distributed.parallel_state import get_tp_group
 
     runner = worker.model_runner
     views = unique_views(runner)
@@ -36,6 +39,8 @@ def kv_file(worker, operation, blocks, filename):
     root = Path(os.environ["DP_OPT_TRANSFER_ROOT"]).resolve()
     if path.resolve().parent != root:
         raise ValueError("Transfer file must stay in the private job directory")
+    if get_tp_group().world_size > 1:
+        path = path.with_name(f"{path.name}.tp{get_tp_group().rank_in_group}")
     if operation not in ("export", "import"):
         raise ValueError("Unknown KV transfer operation")
     if not blocks or len(set(blocks)) != len(blocks) or any(not isinstance(block, int) for block in blocks):
@@ -83,14 +88,17 @@ def kv_file(worker, operation, blocks, filename):
 
 
 def install_runner_state(worker, state):
+    from vllm.distributed.parallel_state import get_dp_group, get_tp_group
     from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
     runner = worker.model_runner
     request_id = state["request_id"]
+    acknowledgment = {"installed": True, "rank": get_dp_group().rank_in_group,
+                      "tp_rank": get_tp_group().rank_in_group, "tp_size": get_tp_group().world_size}
     if state.get("remove"):
         runner.input_batch.remove_request(request_id)
         runner.requests.pop(request_id, None)
-        return True
+        return acknowledgment
     request = pickle.loads(state["request"])
     if request.request_id != request_id:
         raise ValueError("Runner request identity differs from payload")
@@ -102,7 +110,7 @@ def install_runner_state(worker, state):
         sampling_params=request.sampling_params, pooling_params=None, generator=None,
         block_ids=tuple(state["blocks"]), num_computed_tokens=request.num_computed_tokens,
         output_token_ids=list(request.output_token_ids), lora_request=None)
-    return True
+    return acknowledgment
 
 
 def kv_peer(worker, blocks, source_rank, destination_rank, num_blocks):
@@ -113,10 +121,14 @@ def kv_peer(worker, blocks, source_rank, destination_rank, num_blocks):
 
 
 class PlacementScheduler(Scheduler):
+    supports_tensor_parallel = False
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         parallel = self.parallel_config
-        if (parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1
+        if (parallel.tensor_parallel_size < 1
+                or (parallel.tensor_parallel_size != 1 and not self.supports_tensor_parallel)
+                or parallel.pipeline_parallel_size != 1
                 or parallel.data_parallel_size < 2 or self.scheduler_config.async_scheduling
                 or self.cache_config.enable_prefix_caching or self.connector is not None
                 or len(self.kv_cache_config.kv_cache_groups) != 1 or self.num_lookahead_tokens):
@@ -186,6 +198,9 @@ class PlacementScheduler(Scheduler):
             rate = ((samples[-1][1] - samples[0][1]) / duration if duration > 0 else 0)
             records.append({"id": request.request_id, "computed_tokens": request.num_computed_tokens,
                             "prompt_tokens": request.num_prompt_tokens, "output_tokens": request.num_output_tokens,
+                            "in_flight_tokens": request.num_in_flight_tokens,
+                            "phase": request_phase(request.num_computed_tokens, request.num_prompt_tokens,
+                                                   request.num_output_tokens, request in self.running),
                             "blocks": blocks, "movable": bool(movable), "decode_rate_tokens_s": rate,
                             "reserved_at": getattr(request, "placement_reserved_at", None),
                             "reservation_pending": request.request_id in self.placement_unreserved,
@@ -197,6 +212,7 @@ class PlacementScheduler(Scheduler):
                   "memory_gib": manager._memory_limit_page_bundle_bytes() / 1024**3}
                  for page_id in page_ids]
         return {"rank": self.parallel_config.data_parallel_rank, "requests": records, "pages": pages,
+                "phase_schema": 1, "scheduler_paused": self.pause_state == PauseState.PAUSED_ALL,
                 "observed_at": observed_at,
                 "mapped_bytes": int(manager.get_mapped_memory_size()),
                 "page_bytes": manager._memory_limit_page_bundle_bytes(),
@@ -213,6 +229,9 @@ class PlacementScheduler(Scheduler):
         running = {request.request_id for request in self.running}
         records = [{"id": request.request_id, "computed_tokens": request.num_computed_tokens,
                     "prompt_tokens": request.num_prompt_tokens, "output_tokens": request.num_output_tokens,
+                    "in_flight_tokens": request.num_in_flight_tokens,
+                    "phase": request_phase(request.num_computed_tokens, request.num_prompt_tokens,
+                                           request.num_output_tokens, request.request_id in running),
                     "decoding": (request.request_id in running and not request.num_in_flight_tokens
                                  and request.num_computed_tokens >= request.num_prompt_tokens
                                  and request.num_output_tokens > 0),
@@ -222,6 +241,7 @@ class PlacementScheduler(Scheduler):
                     "preemptions": getattr(request, "num_preemptions", 0)}
                    for request in self.requests.values()]
         return {"rank": self.parallel_config.data_parallel_rank, "requests": records,
+                "phase_schema": 1, "scheduler_paused": self.pause_state == PauseState.PAUSED_ALL,
                 "mode": self.placement_mode, "preemptions_total": self.placement_preemptions,
                 "recompute_tokens_total": self.placement_recompute_tokens,
                 "observed_at": time.monotonic(), "mapped_bytes": int(manager.get_mapped_memory_size()),
@@ -436,9 +456,28 @@ class PlacementScheduler(Scheduler):
         return True
 
 
+class TensorParallelPlacementScheduler(PlacementScheduler):
+    supports_tensor_parallel = True
+
+
+class CalibrationScheduler(PlacementScheduler):
+    supports_tensor_parallel = True
+
+    def placement_begin(self, transaction):
+        raise RuntimeError("Calibration scheduler does not support migration")
+
+    def _require_transaction(self, transaction):
+        raise RuntimeError("Calibration scheduler does not support migration")
+
+
 def bind_engine(engine):
     if not isinstance(engine.scheduler, PlacementScheduler):
         return
+    from timing_probe import bind_engine_timing
+    from live_observation import bind_engine_observer
+
+    bind_engine_timing(engine)
+    bind_engine_observer(engine)
     interval = int(os.environ.get("DP_OPT_PAUSE_SYNC_INTERVAL", "32"))
     if interval not in (1, 32):
         raise ValueError("Experimental DP pause-sync interval must be1or32")
@@ -486,15 +525,23 @@ def bind_engine(engine):
 
     def transfer(transaction, operation, blocks, filename):
         engine.scheduler._require_transaction(transaction)
+        if engine.scheduler.parallel_config.tensor_parallel_size != 1:
+            raise RuntimeError("TP migration requires the verified peer transport, not file transport")
         return engine.collective_rpc(kv_file, args=(operation, blocks, filename))[0]
 
     def runner_state(transaction, state):
+        from tp_migration import verify_runner_results
+
         engine.scheduler._require_transaction(transaction)
-        return engine.collective_rpc(install_runner_state, args=(state,))[0]
+        return verify_runner_results(engine.collective_rpc(install_runner_state, args=(state,)),
+                                     engine.scheduler.parallel_config.tensor_parallel_size, engine.dp_rank)
 
     def peer_transfer(transaction, blocks, source_rank, destination_rank, num_blocks):
+        from tp_migration import aggregate_peer
+
         engine.scheduler._require_transaction(transaction)
-        return engine.collective_rpc(kv_peer, args=(blocks, source_rank, destination_rank, num_blocks))[0]
+        results = engine.collective_rpc(kv_peer, args=(blocks, source_rank, destination_rank, num_blocks))
+        return aggregate_peer(results, engine.scheduler.parallel_config.tensor_parallel_size, engine.dp_rank)
 
     engine.placement_kv_file = transfer
     engine.placement_kv_peer = peer_transfer
